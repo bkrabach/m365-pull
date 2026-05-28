@@ -9,12 +9,14 @@ import {
   type TeamsChatMessage,
 } from "./sources/teams-chats"
 import {
-  listMeetingsPage,
-  type MeetingItem,
-} from "./sources/teams-transcripts"
+  listRecordings,
+  formatDurationShort,
+  type ChatType,
+  type RecordingItem,
+} from "./sources/teams-call-recordings"
 import {
+  resolveRecordingFromUrl,
   fetchRecordingTranscripts,
-  findRecordingForMeeting,
 } from "./sources/teams-recordings"
 import { saveAsJson } from "./destinations/browser"
 import { saveToOneDrive, loadFromOneDrive } from "./destinations/onedrive"
@@ -33,7 +35,7 @@ import {
 } from "./cache/chats-cache"
 import { loadMarks, saveMarks } from "./cache/marks"
 import { loadChatPrefs, saveChatPrefs } from "./cache/chat-prefs"
-import { loadMeetingPrefs, saveMeetingPrefs } from "./cache/meeting-prefs"
+import { loadRecordingPrefs, saveRecordingPrefs } from "./cache/recording-prefs"
 import { loadUIState, saveUIState } from "./cache/ui-state"
 import {
   loadOneDriveState,
@@ -42,7 +44,7 @@ import {
   deviceIdentifier,
   type AppState,
   type ChatPrefs,
-  type MeetingPrefs,
+  type RecordingPrefs,
 } from "./state/onedrive-state"
 
 const app = document.getElementById("app") as HTMLDivElement
@@ -67,17 +69,18 @@ if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
 
 // ----- State -----
 
-type SourceId = "teams.chats" | "teams.transcripts"
+type SourceId = "teams.chats" | "teams.recordings"
 
 interface ChatsState {
   chats: TeamsChatItem[]
   nextCursor: string | null
 }
 
-interface MeetingsState {
-  meetings: MeetingItem[]
-  nextCursor: string | null
+interface RecordingsState {
+  recordings: RecordingItem[]
   daysBack: number
+  chatsScanned: number
+  truncated: boolean
 }
 
 type SortKey = "marked-first" | "recent" | "name"
@@ -89,11 +92,11 @@ interface FilterState {
   markedOnly: boolean
 }
 
-interface MeetingFilterState {
+interface RecordingFilterState {
   search: string
   sortKey: SortKey
   markedOnly: boolean
-  enabledKinds: Set<"recurring" | "oneoff">
+  enabledKinds: Set<ChatType>
 }
 
 type SyncStatus = "idle" | "syncing" | "synced" | "error" | "offline"
@@ -104,39 +107,38 @@ const KNOWN_TYPES: { id: string; label: string }[] = [
   { id: "meeting", label: "Meeting" },
 ]
 
-const MEETING_KINDS: { id: "recurring" | "oneoff"; label: string }[] = [
-  { id: "recurring", label: "Series" },
-  { id: "oneoff", label: "One-off" },
+const CHAT_TYPE_KINDS: { id: ChatType; label: string }[] = [
+  { id: "oneOnOne", label: "1:1" },
+  { id: "group", label: "Group" },
+  { id: "meeting", label: "Meeting" },
 ]
 
 const SIGNIN_SCOPES = [
   "User.Read",
   "Chat.Read",
-  "Calendars.Read",
-  "OnlineMeetings.Read",
-  "OnlineMeetingTranscript.Read.All",
+  "Files.Read.All",
   "Files.ReadWrite",
   "Files.ReadWrite.AppFolder",
 ]
 
 let currentSource: SourceId = "teams.chats"
 let chatsState: ChatsState = { chats: [], nextCursor: null }
-let meetingsState: MeetingsState = { meetings: [], nextCursor: null, daysBack: 90 }
+let recordingsState: RecordingsState = { recordings: [], daysBack: 90, chatsScanned: 0, truncated: false }
 let filterState: FilterState = {
   search: "",
   enabledTypes: new Set(KNOWN_TYPES.map((t) => t.id)),
   sortKey: "marked-first",
   markedOnly: false,
 }
-let meetingFilterState: MeetingFilterState = {
+let recordingFilterState: RecordingFilterState = {
   search: "",
   sortKey: "marked-first",
   markedOnly: false,
-  enabledKinds: new Set(MEETING_KINDS.map((k) => k.id)),
+  enabledKinds: new Set(CHAT_TYPE_KINDS.map((k) => k.id)),
 }
 let markedIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
-let meetingPrefs: Record<string, MeetingPrefs> = {}
+let recordingPrefs: Record<string, RecordingPrefs> = {}
 let userPrefs: UserPrefs = {
   destination: "browser",
   oneDriveFolder: "/m365-pull/teams-chats",
@@ -211,8 +213,8 @@ function buildLocalState(): AppState {
     updatedBy: deviceIdentifier(),
     marks: [...markedIds].sort(),
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
-    meetingPrefs:
-      Object.keys(meetingPrefs).length > 0 ? meetingPrefs : undefined,
+    recordingPrefs:
+      Object.keys(recordingPrefs).length > 0 ? recordingPrefs : undefined,
     userPrefs,
   }
 }
@@ -318,11 +320,11 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       JSON.stringify(mergedPrefs) !== JSON.stringify(chatPrefs)
     chatPrefs = mergedPrefs
     saveChatPrefs(userCacheKey(), chatPrefs)
-    const mergedMeetingPrefs = merged.meetingPrefs ?? {}
-    const meetingPrefsChanged =
-      JSON.stringify(mergedMeetingPrefs) !== JSON.stringify(meetingPrefs)
-    meetingPrefs = mergedMeetingPrefs
-    saveMeetingPrefs(userCacheKey(), meetingPrefs)
+    const mergedRecordingPrefs = merged.recordingPrefs ?? {}
+    const recordingPrefsChanged =
+      JSON.stringify(mergedRecordingPrefs) !== JSON.stringify(recordingPrefs)
+    recordingPrefs = mergedRecordingPrefs
+    saveRecordingPrefs(userCacheKey(), recordingPrefs)
     let userPrefsChanged = false
     if (merged.userPrefs) {
       userPrefsChanged =
@@ -332,7 +334,7 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       if (userPrefsChanged) syncUserPrefsToUI()
     }
     const changed =
-      marksChanged || prefsChanged || meetingPrefsChanged || userPrefsChanged
+      marksChanged || prefsChanged || recordingPrefsChanged || userPrefsChanged
     if (changed) {
       await saveOneDriveState(msal, {
         ...merged,
@@ -340,7 +342,7 @@ async function pullAndMergeOneDriveState(): Promise<void> {
         updatedBy: deviceIdentifier(),
       })
       rerenderChatList()
-      rerenderMeetingsList()
+      rerenderRecordingsList()
     } else if (!remote) {
       await saveOneDriveState(msal, local)
     }
@@ -394,25 +396,24 @@ function countByType(chats: TeamsChatItem[]): Map<string, number> {
   return counts
 }
 
-function applyMeetingFiltersAndSort(meetings: MeetingItem[]): MeetingItem[] {
-  const q = meetingFilterState.search.trim().toLowerCase()
-  let result = meetings.filter((m) => {
-    if (meetingFilterState.markedOnly && !markedIds.has(m.id)) return false
-    const kind: "recurring" | "oneoff" = m.isRecurring ? "recurring" : "oneoff"
-    if (!meetingFilterState.enabledKinds.has(kind)) return false
+function applyRecordingFiltersAndSort(recordings: RecordingItem[]): RecordingItem[] {
+  const q = recordingFilterState.search.trim().toLowerCase()
+  let result = recordings.filter((r) => {
+    if (recordingFilterState.markedOnly && !markedIds.has(r.id)) return false
+    if (!recordingFilterState.enabledKinds.has(r.chatType)) return false
     if (q) {
-      const haystack = `${m.subject} ${m.organizerName} ${m.organizerEmail}`.toLowerCase()
+      const haystack = `${r.filename} ${r.chatTopic ?? ""}`.toLowerCase()
       if (!haystack.includes(q)) return false
     }
     return true
   })
-  const byRecent = (a: MeetingItem, b: MeetingItem) =>
-    a.startDateTime < b.startDateTime ? 1 : -1
-  const bySubject = (a: MeetingItem, b: MeetingItem) =>
-    (a.subject || "").localeCompare(b.subject || "")
-  if (meetingFilterState.sortKey === "name") {
-    result = [...result].sort(bySubject)
-  } else if (meetingFilterState.sortKey === "recent") {
+  const byRecent = (a: RecordingItem, b: RecordingItem) =>
+    a.eventCreatedDateTime < b.eventCreatedDateTime ? 1 : -1
+  const byName = (a: RecordingItem, b: RecordingItem) =>
+    (a.chatTopic || a.filename).localeCompare(b.chatTopic || b.filename)
+  if (recordingFilterState.sortKey === "name") {
+    result = [...result].sort(byName)
+  } else if (recordingFilterState.sortKey === "recent") {
     result = [...result].sort(byRecent)
   } else {
     result = [...result].sort((a, b) => {
@@ -449,7 +450,7 @@ function render(): void {
     app.innerHTML = `
       <div class="signin-card">
         <h1>m365-pull</h1>
-        <p>Sign in with your Microsoft account to browse and download your Teams chats and meeting transcripts.</p>
+        <p>Sign in with your Microsoft account to browse and download your Teams chats and call recordings.</p>
         <button id="signin" class="primary">Sign in with Microsoft</button>
       </div>
     `
@@ -461,7 +462,7 @@ function render(): void {
 
   markedIds = loadMarks(userCacheKey())
   chatPrefs = loadChatPrefs(userCacheKey())
-  meetingPrefs = loadMeetingPrefs(userCacheKey())
+  recordingPrefs = loadRecordingPrefs(userCacheKey())
   userPrefs = loadUserPrefs(userCacheKey())
   hydrateUIStateFromStorage()
 
@@ -519,7 +520,7 @@ function render(): void {
           Source
           <select id="source-select">
             <option value="teams.chats">Teams chats</option>
-            <option value="teams.transcripts">Teams meeting transcripts</option>
+            <option value="teams.recordings">Call recordings</option>
           </select>
         </label>
         <span class="label">to</span>
@@ -545,8 +546,8 @@ function render(): void {
         <button id="bulk-chats" class="bulk-action" hidden></button>
       </div>
       <div class="actions" id="actions-transcripts" hidden>
-        <button id="loadmeetings" class="primary">Load my meetings</button>
-        <button id="refreshmeetings" hidden>Refresh</button>
+        <button id="load-recordings" class="primary">Load my recordings</button>
+        <button id="refresh-recordings" hidden>Refresh</button>
         <span class="label">Window:</span>
         <select id="daysback" title="How far back to search the calendar">
           <option value="7">Last 7 days</option>
@@ -554,7 +555,7 @@ function render(): void {
           <option value="90" selected>Last 90 days</option>
           <option value="365">Last year</option>
         </select>
-        <button id="bulk-meetings" class="bulk-action" hidden></button>
+        <button id="bulk-recordings" class="bulk-action" hidden></button>
       </div>
 
       <div class="filters" id="filters" hidden>
@@ -575,27 +576,27 @@ function render(): void {
         </label>
         <button class="chip marked-only" id="markedonly">★ Marked only</button>
       </div>
-      <div class="filters" id="filters-meetings" hidden>
-        <input id="search-meetings" type="search" placeholder="Search meetings by subject or organizer…" />
+      <div class="filters" id="filters-recordings" hidden>
+        <input id="search-recordings" type="search" placeholder="Search recordings by topic or filename…" />
         <div class="chips" id="kind-chips">
-          ${MEETING_KINDS.map(
+          ${CHAT_TYPE_KINDS.map(
             (k) =>
               `<button class="chip active" data-kind="${k.id}">${escapeHtml(k.label)} <span class="chip-count">0</span></button>`,
           ).join("")}
         </div>
         <label class="sort-label">
           Sort
-          <select id="sortby-meetings">
+          <select id="sortby-recordings">
             <option value="marked-first">Marked first · then recent</option>
             <option value="recent">Most recent</option>
             <option value="name">Subject (A–Z)</option>
           </select>
         </label>
-        <button class="chip marked-only" id="markedonly-meetings">★ Marked only</button>
+        <button class="chip marked-only" id="markedonly-recordings">★ Marked only</button>
       </div>
       <div id="status"></div>
       <ul id="chats" class="chat-list"></ul>
-      <ul id="meetings" class="chat-list" hidden></ul>
+      <ul id="recordings" class="chat-list" hidden></ul>
       <div id="loadmore-row" class="loadmore-row" hidden>
         <button id="loadmore">Load more</button>
       </div>
@@ -635,24 +636,24 @@ function wireGlobalHandlers(account: AccountInfo): void {
   })
 
   // Transcripts actions
-  el<HTMLButtonElement>("loadmeetings").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.transcripts")
-    void initialLoadMeetings()
+  el<HTMLButtonElement>("load-recordings").addEventListener("click", () => {
+    switchSourceIfNeeded("teams.recordings")
+    void initialLoadRecordings()
   })
-  el<HTMLButtonElement>("refreshmeetings").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.transcripts")
-    void refreshMeetings()
+  el<HTMLButtonElement>("refresh-recordings").addEventListener("click", () => {
+    switchSourceIfNeeded("teams.recordings")
+    void refreshRecordings()
   })
 
   // Bulk download buttons
   el<HTMLButtonElement>("bulk-chats").addEventListener("click", () => {
     void bulkDownloadChats()
   })
-  el<HTMLButtonElement>("bulk-meetings").addEventListener("click", () => {
-    void bulkDownloadMeetings()
+  el<HTMLButtonElement>("bulk-recordings").addEventListener("click", () => {
+    void bulkDownloadRecordings()
   })
   el<HTMLSelectElement>("daysback").addEventListener("change", (e) => {
-    meetingsState.daysBack = parseInt((e.target as HTMLSelectElement).value, 10) || 90
+    recordingsState.daysBack = parseInt((e.target as HTMLSelectElement).value, 10) || 90
     saveUIPrefs()
   })
 
@@ -662,43 +663,43 @@ function wireGlobalHandlers(account: AccountInfo): void {
   })
 
   // Meeting filters
-  const searchMeetings = el<HTMLInputElement>("search-meetings")
+  const searchMeetings = el<HTMLInputElement>("search-recordings")
   let searchMeetingsTimer: number | null = null
   searchMeetings.addEventListener("input", () => {
     if (searchMeetingsTimer) window.clearTimeout(searchMeetingsTimer)
     searchMeetingsTimer = window.setTimeout(() => {
-      meetingFilterState.search = searchMeetings.value
-      rerenderMeetingsList()
+      recordingFilterState.search = searchMeetings.value
+      rerenderRecordingsList()
       saveUIPrefs()
     }, 150)
   })
-  el<HTMLSelectElement>("sortby-meetings").addEventListener("change", (e) => {
-    meetingFilterState.sortKey = (e.target as HTMLSelectElement).value as SortKey
-    rerenderMeetingsList()
+  el<HTMLSelectElement>("sortby-recordings").addEventListener("change", (e) => {
+    recordingFilterState.sortKey = (e.target as HTMLSelectElement).value as SortKey
+    rerenderRecordingsList()
     saveUIPrefs()
   })
-  el<HTMLButtonElement>("markedonly-meetings").addEventListener("click", () => {
-    meetingFilterState.markedOnly = !meetingFilterState.markedOnly
-    el<HTMLButtonElement>("markedonly-meetings").classList.toggle(
+  el<HTMLButtonElement>("markedonly-recordings").addEventListener("click", () => {
+    recordingFilterState.markedOnly = !recordingFilterState.markedOnly
+    el<HTMLButtonElement>("markedonly-recordings").classList.toggle(
       "active",
-      meetingFilterState.markedOnly,
+      recordingFilterState.markedOnly,
     )
-    rerenderMeetingsList()
+    rerenderRecordingsList()
     saveUIPrefs()
   })
   el<HTMLDivElement>("kind-chips")
     .querySelectorAll<HTMLButtonElement>(".chip[data-kind]")
     .forEach((chip) => {
       chip.addEventListener("click", () => {
-        const k = chip.dataset.kind as "recurring" | "oneoff"
-        if (meetingFilterState.enabledKinds.has(k)) {
-          meetingFilterState.enabledKinds.delete(k)
+        const k = chip.dataset.kind as ChatType
+        if (recordingFilterState.enabledKinds.has(k)) {
+          recordingFilterState.enabledKinds.delete(k)
           chip.classList.remove("active")
         } else {
-          meetingFilterState.enabledKinds.add(k)
+          recordingFilterState.enabledKinds.add(k)
           chip.classList.add("active")
         }
-        rerenderMeetingsList()
+        rerenderRecordingsList()
         saveUIPrefs()
       })
     })
@@ -706,7 +707,7 @@ function wireGlobalHandlers(account: AccountInfo): void {
   // Shared load-more button (context-dependent)
   el<HTMLButtonElement>("loadmore").addEventListener("click", () => {
     if (currentSource === "teams.chats") void loadMoreChats()
-    else void loadMoreMeetings()
+    // recordings source has no pagination -- loadmore-row stays hidden
   })
 
   // Chats filters
@@ -829,11 +830,11 @@ function saveUIPrefs(): void {
       sortKey: filterState.sortKey,
       markedOnly: filterState.markedOnly,
     },
-    meetingFilter: {
-      search: meetingFilterState.search,
-      enabledKinds: [...meetingFilterState.enabledKinds],
-      sortKey: meetingFilterState.sortKey,
-      markedOnly: meetingFilterState.markedOnly,
+    recordingFilter: {
+      search: recordingFilterState.search,
+      enabledKinds: [...recordingFilterState.enabledKinds],
+      sortKey: recordingFilterState.sortKey,
+      markedOnly: recordingFilterState.markedOnly,
     },
   })
 }
@@ -842,7 +843,7 @@ function saveUIPrefs(): void {
  * Runs after the HTML is rendered (handlers wired later read these values). */
 function hydrateUIStateFromStorage(): void {
   const saved = loadUIState(userCacheKey())
-  if (saved.currentSource === "teams.chats" || saved.currentSource === "teams.transcripts") {
+  if (saved.currentSource === "teams.chats" || saved.currentSource === "teams.recordings") {
     currentSource = saved.currentSource
   }
   if (saved.chatFilter) {
@@ -855,21 +856,21 @@ function hydrateUIStateFromStorage(): void {
       markedOnly: saved.chatFilter.markedOnly ?? false,
     }
   }
-  if (saved.meetingFilter) {
-    meetingFilterState = {
-      search: saved.meetingFilter.search ?? "",
+  if (saved.recordingFilter) {
+    recordingFilterState = {
+      search: saved.recordingFilter.search ?? "",
       enabledKinds: new Set(
-        (saved.meetingFilter.enabledKinds ?? MEETING_KINDS.map((k) => k.id)).filter(
-          (k): k is "recurring" | "oneoff" => k === "recurring" || k === "oneoff",
+        (saved.recordingFilter.enabledKinds ?? CHAT_TYPE_KINDS.map((k) => k.id)).filter(
+          (k): k is ChatType => k === "oneOnOne" || k === "group" || k === "meeting",
         ),
       ),
-      sortKey: saved.meetingFilter.sortKey ?? "marked-first",
-      markedOnly: saved.meetingFilter.markedOnly ?? false,
+      sortKey: saved.recordingFilter.sortKey ?? "marked-first",
+      markedOnly: saved.recordingFilter.markedOnly ?? false,
     }
   }
   if (saved.daysBack) {
     const n = parseInt(saved.daysBack, 10)
-    if (Number.isFinite(n) && n > 0) meetingsState.daysBack = n
+    if (Number.isFinite(n) && n > 0) recordingsState.daysBack = n
   }
   // Note: lookback dropdown value is restored in syncUIControlsFromState
   // (called after handlers are wired and the DOM is interactive).
@@ -887,7 +888,7 @@ function syncUIControlsFromState(): void {
   if (lookbackEl && saved.lookback) lookbackEl.value = saved.lookback
   // Meeting daysBack
   const daysbackEl = document.getElementById("daysback") as HTMLSelectElement | null
-  if (daysbackEl) daysbackEl.value = String(meetingsState.daysBack)
+  if (daysbackEl) daysbackEl.value = String(recordingsState.daysBack)
   // Chat filter UI: search, sortby, type chips, markedonly
   const searchEl = document.getElementById("search") as HTMLInputElement | null
   if (searchEl) searchEl.value = filterState.search
@@ -903,18 +904,18 @@ function syncUIControlsFromState(): void {
       chip.classList.toggle("active", enabled)
     })
   // Meeting filter UI: search, sortby, kind chips, markedonly
-  const searchMeetingsEl = document.getElementById("search-meetings") as HTMLInputElement | null
-  if (searchMeetingsEl) searchMeetingsEl.value = meetingFilterState.search
-  const sortbyMeetingsEl = document.getElementById("sortby-meetings") as HTMLSelectElement | null
-  if (sortbyMeetingsEl) sortbyMeetingsEl.value = meetingFilterState.sortKey
-  const markedOnlyMeetings = document.getElementById("markedonly-meetings")
+  const searchMeetingsEl = document.getElementById("search-recordings") as HTMLInputElement | null
+  if (searchMeetingsEl) searchMeetingsEl.value = recordingFilterState.search
+  const sortbyMeetingsEl = document.getElementById("sortby-recordings") as HTMLSelectElement | null
+  if (sortbyMeetingsEl) sortbyMeetingsEl.value = recordingFilterState.sortKey
+  const markedOnlyMeetings = document.getElementById("markedonly-recordings")
   if (markedOnlyMeetings)
-    markedOnlyMeetings.classList.toggle("active", meetingFilterState.markedOnly)
+    markedOnlyMeetings.classList.toggle("active", recordingFilterState.markedOnly)
   document
     .querySelectorAll<HTMLButtonElement>("#kind-chips .chip[data-kind]")
     .forEach((chip) => {
-      const k = chip.dataset.kind as "recurring" | "oneoff" | undefined
-      const enabled = k ? meetingFilterState.enabledKinds.has(k) : true
+      const k = chip.dataset.kind as ChatType | undefined
+      const enabled = k ? recordingFilterState.enabledKinds.has(k) : true
       chip.classList.toggle("active", enabled)
     })
 }
@@ -924,14 +925,14 @@ function applySourceVisibility(): void {
   el<HTMLDivElement>("actions-chats").hidden = !isChats
   el<HTMLDivElement>("actions-transcripts").hidden = isChats
   el<HTMLUListElement>("chats").hidden = !isChats
-  el<HTMLUListElement>("meetings").hidden = isChats
+  el<HTMLUListElement>("recordings").hidden = isChats
   updateFiltersVisibility()
   if (isChats) {
     updateLoadMore()
     updateMatchSummary(applyFiltersAndSort(chatsState.chats).length)
   } else {
-    updateLoadMoreMeetings()
-    updateMeetingsSummary()
+    el<HTMLDivElement>("loadmore-row").hidden = true
+    updateRecordingsSummary()
   }
 }
 
@@ -1012,7 +1013,7 @@ function toggleMark(id: string): void {
   else markedIds.add(id)
   saveMarks(userCacheKey(), markedIds)
   rerenderChatList()
-  rerenderMeetingsList()
+  rerenderRecordingsList()
   updateBulkButtons()
   scheduleOneDriveSave()
 }
@@ -1032,8 +1033,8 @@ function updateTypeCountChips(): void {
 function updateFiltersVisibility(): void {
   el<HTMLDivElement>("filters").hidden =
     currentSource !== "teams.chats" || chatsState.chats.length === 0
-  el<HTMLDivElement>("filters-meetings").hidden =
-    currentSource !== "teams.transcripts" || meetingsState.meetings.length === 0
+  el<HTMLDivElement>("filters-recordings").hidden =
+    currentSource !== "teams.recordings" || recordingsState.recordings.length === 0
 }
 
 function updateLoadMore(): void {
@@ -1123,49 +1124,45 @@ async function refreshChats(): Promise<void> {
 
 // ----- Meetings rendering -----
 
-function rerenderMeetingsList(): void {
-  const list = el<HTMLUListElement>("meetings")
-  const filtered = applyMeetingFiltersAndSort(meetingsState.meetings)
-  if (meetingsState.meetings.length === 0) {
-    const note = meetingsState.nextCursor
-      ? "No Teams meetings in this batch of calendar events — click Load more to keep searching."
-      : "No Teams meetings found in this window. Try widening the window."
-    list.innerHTML = `<li class="empty">${note}</li>`
+function rerenderRecordingsList(): void {
+  const list = el<HTMLUListElement>("recordings")
+  const filtered = applyRecordingFiltersAndSort(recordingsState.recordings)
+  if (recordingsState.recordings.length === 0) {
+    list.innerHTML = `<li class="empty">No recordings found in this window. Try widening the window.</li>`
   } else if (filtered.length === 0) {
-    list.innerHTML = `<li class="empty">No meetings match these filters. ${
-      meetingFilterState.markedOnly
-        ? "Star some meetings to add them here."
-        : "Loosen the filters or load more meetings."
+    list.innerHTML = `<li class="empty">No recordings match these filters. ${
+      recordingFilterState.markedOnly
+        ? "Star some recordings to add them here."
+        : "Loosen the filters."
     }</li>`
   } else {
-    list.innerHTML = filtered.map(renderMeetingRow).join("")
+    list.innerHTML = filtered.map(renderRecordingRow).join("")
     list.querySelectorAll<HTMLButtonElement>(".chat-action").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const eventId = btn.dataset.eventId!
-        void downloadMeetingTranscripts(eventId, btn)
+        const eventId = btn.dataset.recordingId!
+        void downloadRecordingTranscript(eventId, btn)
       })
     })
     list.querySelectorAll<HTMLButtonElement>(".mark-toggle").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const id = btn.dataset.meetingId
+        const id = btn.dataset.recordingId
         if (id) toggleMark(id)
       })
     })
   }
   updateFiltersVisibility()
-  updateMeetingKindChips()
-  if (currentSource === "teams.transcripts") {
-    updateMeetingsSummary()
+  updateChatTypeChips()
+  if (currentSource === "teams.recordings") {
+    updateRecordingsSummary()
   }
   updateBulkButtons()
 }
 
-/** Mirror of updateTypeCountChips for the meeting kind chips (Series / One-off). */
-function updateMeetingKindChips(): void {
+/** Mirror of updateTypeCountChips for the recording kind chips (1:1 / Group / Meeting). */
+function updateChatTypeChips(): void {
   const counts = new Map<string, number>()
-  for (const m of meetingsState.meetings) {
-    const k: "recurring" | "oneoff" = m.isRecurring ? "recurring" : "oneoff"
-    counts.set(k, (counts.get(k) || 0) + 1)
+  for (const r of recordingsState.recordings) {
+    counts.set(r.chatType, (counts.get(r.chatType) || 0) + 1)
   }
   const chips = document.getElementById("kind-chips")
   if (!chips) return
@@ -1182,9 +1179,9 @@ function updateMeetingKindChips(): void {
 /** Compute marked subsets for each loaded source and update bulk-action buttons. */
 function updateBulkButtons(): void {
   const markedChats = chatsState.chats.filter((c) => markedIds.has(c.id))
-  const markedMeetings = meetingsState.meetings.filter((m) => markedIds.has(m.id))
+  const markedMeetings = recordingsState.recordings.filter((m) => markedIds.has(m.id))
   const chatBtn = document.getElementById("bulk-chats") as HTMLButtonElement | null
-  const meetingBtn = document.getElementById("bulk-meetings") as HTMLButtonElement | null
+  const meetingBtn = document.getElementById("bulk-recordings") as HTMLButtonElement | null
   if (chatBtn) {
     if (markedChats.length > 0) {
       chatBtn.hidden = false
@@ -1203,120 +1200,83 @@ function updateBulkButtons(): void {
   }
 }
 
-function renderMeetingRow(m: MeetingItem): string {
-  const subject = m.subject || "(no subject)"
-  const start = m.startDateTime ? formatDate(m.startDateTime) : ""
-  const organizer = m.organizerName || m.organizerEmail || "unknown organizer"
-  const isMarked = markedIds.has(m.id)
-  const lastSync = meetingPrefs[m.id]?.lastSync
+function renderRecordingRow(r: RecordingItem): string {
+  const account = msal.getActiveAccount()
+  const userOid = account?.localAccountId?.toLowerCase() ?? null
+  const youInitiated =
+    r.initiatorOid !== null && userOid !== null &&
+    r.initiatorOid.toLowerCase() === userOid
+  const title = r.chatTopic?.trim() || r.filename
+  const start = formatDate(r.eventCreatedDateTime)
+  const dur = formatDurationShort(r.durationIso)
+  const isMarked = markedIds.has(r.id)
+  const lastSync = recordingPrefs[r.id]?.lastSync
   const downloadedTag = lastSync
     ? ` · downloaded ${formatDateShort(new Date(lastSync))}`
     : ""
-  const sub = `${start} · ${organizer}${downloadedTag}`
+  const kindLabel =
+    r.chatType === "oneOnOne" ? "1:1" : r.chatType === "group" ? "Group" : "Meeting"
+  const initiatorTag = youInitiated ? " · you started" : ""
+  const sub = `${start} · ${kindLabel}${dur ? ` · ${dur}` : ""}${initiatorTag}${downloadedTag}`
   return `
     <li class="chat-row${isMarked ? " marked" : ""}">
-      <button class="mark-toggle${isMarked ? " marked" : ""}" data-meeting-id="${escapeHtml(m.id)}" title="${isMarked ? "Unmark" : "Mark"} this meeting" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "★" : "☆"}</button>
+      <button class="mark-toggle${isMarked ? " marked" : ""}" data-recording-id="${escapeHtml(r.id)}" title="${isMarked ? "Unmark" : "Mark"} this recording" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "★" : "☆"}</button>
       <div class="chat-info">
-        <div class="chat-name">${escapeHtml(subject)}</div>
+        <div class="chat-name">${escapeHtml(title)}</div>
         <div class="chat-sub">${escapeHtml(sub)}</div>
       </div>
-      <button class="chat-action" data-event-id="${escapeHtml(m.id)}">Download transcript</button>
+      <button class="chat-action" data-recording-id="${escapeHtml(r.id)}">Download transcript</button>
     </li>
   `
 }
 
-function updateMeetingsSummary(): void {
-  const total = meetingsState.meetings.length
-  const filtered = applyMeetingFiltersAndSort(meetingsState.meetings).length
-  const marked = meetingsState.meetings.filter((m) => markedIds.has(m.id)).length
-  const hasMore = meetingsState.nextCursor !== null
-  const more = hasMore ? " · more available" : ""
-  if (total === 0) {
-    setStatus(
-      hasMore
-        ? `No Teams meetings yet in last ${meetingsState.daysBack} days · more pages available — try Load more`
-        : `No Teams meetings in last ${meetingsState.daysBack} days. Widen the window.`,
-    )
-  } else if (filtered < total) {
-    setStatus(
-      `Showing ${filtered} of ${total} loaded · ${marked} marked${more}`,
-    )
+function updateRecordingsSummary(): void {
+  const n = recordingsState.recordings.length
+  const filtered = applyRecordingFiltersAndSort(recordingsState.recordings).length
+  const marked = recordingsState.recordings.filter((r) => markedIds.has(r.id)).length
+  const { chatsScanned, truncated } = recordingsState
+  if (n === 0) {
+    setStatus(`No recordings in last ${recordingsState.daysBack} days. Widen the window.`)
+  } else if (filtered < n) {
+    setStatus(`Showing ${filtered} of ${n} · ${marked} marked · from ${chatsScanned} chat(s)${truncated ? " · (chat list truncated — narrow window or add pagination)" : ""}`)
   } else {
-    setStatus(
-      `${total} meeting${total === 1 ? "" : "s"} loaded (last ${meetingsState.daysBack} days) · ${marked} marked${more}`,
-    )
+    setStatus(`${n} recording(s) from ${chatsScanned} chat(s) (last ${recordingsState.daysBack} days) · ${marked} marked${truncated ? " · (chat list truncated — narrow window or add pagination)" : ""}`)
   }
 }
 
-function updateLoadMoreMeetings(): void {
-  if (currentSource !== "teams.transcripts") return
-  const row = el<HTMLDivElement>("loadmore-row")
-  const btn = el<HTMLButtonElement>("loadmore")
-  if (meetingsState.nextCursor) {
-    row.hidden = false
-    btn.textContent = `Load more meetings (${meetingsState.meetings.length} loaded so far)`
-    btn.disabled = false
-  } else {
-    row.hidden = true
-  }
+function showRecordingsRefreshButton(): void {
+  el<HTMLButtonElement>("load-recordings").hidden = true
+  el<HTMLButtonElement>("refresh-recordings").hidden = false
 }
 
-function showMeetingsRefreshButton(): void {
-  el<HTMLButtonElement>("loadmeetings").hidden = true
-  el<HTMLButtonElement>("refreshmeetings").hidden = false
-}
+// ----- Recordings loading -----
 
-// ----- Meetings loading -----
-
-async function initialLoadMeetings(): Promise<void> {
-  setStatus(`Loading meetings (last ${meetingsState.daysBack} days)…`)
-  el<HTMLUListElement>("meetings").innerHTML = ""
-  const loadBtn = el<HTMLButtonElement>("loadmeetings")
-  const refreshBtn = el<HTMLButtonElement>("refreshmeetings")
+async function initialLoadRecordings(): Promise<void> {
+  const loadBtn = el<HTMLButtonElement>("load-recordings")
   loadBtn.disabled = true
-  refreshBtn.disabled = true
+  loadBtn.textContent = "Loading…"
   try {
-    const page = await listMeetingsPage(msal, null, {
-      daysBack: meetingsState.daysBack,
+    const result = await listRecordings(msal, {
+      daysBack: recordingsState.daysBack,
+      onProgress: (note) => setStatus(note),
     })
-    meetingsState.meetings = page.meetings
-    meetingsState.nextCursor = page.nextCursor
-    rerenderMeetingsList()
-    updateLoadMoreMeetings()
-    showMeetingsRefreshButton()
+    recordingsState.recordings = result.recordings
+    recordingsState.chatsScanned = result.chatsScanned
+    recordingsState.truncated = result.truncated
+    rerenderRecordingsList()
+    showRecordingsRefreshButton()
   } catch (err) {
-    setStatus(`Failed to load meetings: ${(err as Error).message}`, "error")
+    setStatus(`Failed to load recordings: ${(err as Error).message}`, "error")
   } finally {
     loadBtn.disabled = false
-    refreshBtn.disabled = false
+    loadBtn.textContent = "Load my recordings"
   }
 }
 
-async function loadMoreMeetings(): Promise<void> {
-  if (!meetingsState.nextCursor) return
-  const btn = el<HTMLButtonElement>("loadmore")
-  btn.disabled = true
-  btn.textContent = "Loading more…"
-  try {
-    const page = await listMeetingsPage(msal, meetingsState.nextCursor, {
-      daysBack: meetingsState.daysBack,
-    })
-    meetingsState.meetings = [...meetingsState.meetings, ...page.meetings]
-    meetingsState.nextCursor = page.nextCursor
-    rerenderMeetingsList()
-    updateLoadMoreMeetings()
-  } catch (err) {
-    setStatus(`Load more failed: ${(err as Error).message}`, "error")
-    btn.disabled = false
-    btn.textContent = "Load more meetings"
-  }
-}
-
-async function refreshMeetings(): Promise<void> {
-  meetingsState = { ...meetingsState, meetings: [], nextCursor: null }
-  el<HTMLUListElement>("meetings").innerHTML = ""
-  el<HTMLDivElement>("loadmore-row").hidden = true
-  await initialLoadMeetings()
+async function refreshRecordings(): Promise<void> {
+  recordingsState = { recordings: [], daysBack: recordingsState.daysBack, chatsScanned: 0, truncated: false }
+  el<HTMLUListElement>("recordings").innerHTML = ""
+  await initialLoadRecordings()
 }
 
 // ----- Downloading a chat -----
@@ -1460,111 +1420,85 @@ async function downloadChat(
   }
 }
 
-// ----- Downloading meeting transcripts -----
+// ----- Downloading recording transcripts -----
 
-async function downloadMeetingTranscripts(
-  eventId: string,
+async function downloadRecordingTranscript(
+  recordingId: string,
   button: HTMLButtonElement,
 ): Promise<boolean> {
-  const meeting = meetingsState.meetings.find((m) => m.id === eventId)
-  if (!meeting) {
-    setStatus("Meeting not found in current list. Refresh and try again.", "error")
+  const recording = recordingsState.recordings.find((r) => r.id === recordingId)
+  if (!recording) {
+    setStatus("Recording not found in current list. Refresh and try again.", "error")
     return false
   }
-  const subject = meeting.subject || "(no subject)"
-  button.disabled = true
   const originalLabel = button.textContent
-  button.textContent = "Searching…"
+  button.disabled = true
+  button.textContent = "Resolving…"
+  const subject = recording.chatTopic?.trim() || recording.filename
   try {
-    // Recording-based path: search for the meeting's recording in user's
-    // accessible content, then pull transcripts off the recording file.
-    // This bypasses the onlineMeetings permission ceiling (organizer-only).
-    setStatus(`Searching for recording of "${subject}"…`)
-    const recording = await findRecordingForMeeting(
-      msal,
-      meeting.subject,
-      meeting.startDateTime,
-    )
-    if (!recording) {
-      setStatus(
-        `No recording found for "${subject}". (Meeting may not have been recorded, or the recording isn't shared with you.)`,
-        "error",
-      )
-      return false
-    }
-    setStatus(`Found "${recording.name}". Fetching transcripts…`)
-    button.textContent = "Fetching…"
-    const payload = await fetchRecordingTranscripts(msal, recording, {
+    const resolved = await resolveRecordingFromUrl(msal, recording.url)
+    button.textContent = "Fetching transcripts…"
+    setStatus(`Fetching transcripts for "${subject}"…`)
+    const payload = await fetchRecordingTranscripts(msal, resolved, {
       onProgress: ({ stage, count, total }) => {
         const counter =
           typeof count === "number" && typeof total === "number"
             ? ` (${count}/${total})`
             : ""
-        setStatus(`"${subject}": ${stage}${counter}`)
+        setStatus(`${subject}: ${stage}${counter}`)
       },
     })
     if (payload.transcriptCount === 0) {
       setStatus(
-        `Recording for "${subject}" has no transcripts attached. (Transcription must be enabled for the meeting.)`,
+        `No transcripts attached to "${subject}". (Transcription may not have been enabled.)`,
       )
       return false
     }
     button.textContent = "Saving…"
+    const stableName = recording.id.replace(/[^a-zA-Z0-9]/g, "")
+    const filename = `recording-transcript-${stableName}.json`
     const destination = userPrefs.destination
-    const stableEventId = eventId.replace(/[^a-zA-Z0-9]/g, "")
-    const filename = `teams-meeting-${stableEventId}.json`
-    // Enrich the payload with calendar-event context for downstream use
-    const archive = {
-      ...payload,
-      eventId,
-      subject,
-      startDateTime: meeting.startDateTime,
-      endDateTime: meeting.endDateTime,
-      organizerName: meeting.organizerName,
-      organizerEmail: meeting.organizerEmail,
-    }
-
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
+    const archivePayload = {
+      ...payload,
+      recordingId: recording.id,
+      callId: recording.callId,
+      filename: recording.filename,
+      chatId: recording.chatId,
+      chatTopic: recording.chatTopic,
+      chatType: recording.chatType,
+      url: recording.url,
+      durationIso: recording.durationIso,
+      organizerOid: recording.organizerOid,
+      initiatorOid: recording.initiatorOid,
+      eventCreatedDateTime: recording.eventCreatedDateTime,
+    }
     if (destination === "onedrive") {
       const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${filename}`
-      setStatus(`Saving ${payload.transcriptCount} transcript(s) to OneDrive…`)
-      result = await saveToOneDrive(msal, fullPath, archive)
+      result = await saveToOneDrive(msal, fullPath, archivePayload)
     } else {
-      setStatus(`${payload.transcriptCount} transcript(s) fetched. Saving…`)
-      result = await saveAsJson(filename, archive)
+      result = await saveAsJson(filename, archivePayload)
     }
-
     if (result.saved) {
-      // Record successful download for "downloaded today" badge + cross-device sync
-      meetingPrefs = {
-        ...meetingPrefs,
-        [eventId]: {
-          ...(meetingPrefs[eventId] ?? {}),
+      recordingPrefs = {
+        ...recordingPrefs,
+        [recording.id]: {
+          ...(recordingPrefs[recording.id] ?? {}),
           lastSync: new Date().toISOString(),
         },
       }
-      saveMeetingPrefs(userCacheKey(), meetingPrefs)
+      saveRecordingPrefs(userCacheKey(), recordingPrefs)
       scheduleOneDriveSave()
-      rerenderMeetingsList()
+      rerenderRecordingsList()
       if (destination === "onedrive") {
         const where = result.path ? `OneDrive (${result.path})` : "OneDrive"
-        setStatus(
-          `✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}" to ${where}.`,
-        )
+        setStatus(`✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}" to ${where}.`)
       } else {
-        setStatus(
-          `✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}".`,
-        )
+        setStatus(`✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}".`)
       }
       return true
     } else if (result.reason === "cancelled") {
       setStatus(`Save cancelled. (${payload.transcriptCount} transcripts fetched but not written.)`)
-      return false
-    } else if (result.reason === "unsupported") {
-      setStatus(
-        "Browser save not supported here — use Microsoft Edge or another Chromium-based browser.",
-        "error",
-      )
       return false
     } else {
       setStatus(`Save failed: ${result.reason}`, "error")
@@ -1572,11 +1506,11 @@ async function downloadMeetingTranscripts(
     }
   } catch (err) {
     setStatus(`Error: ${(err as Error).message}`, "error")
-    console.error("[m365-pull] downloadMeetingTranscripts failed:", err)
+    console.error("[m365-pull] downloadRecordingTranscript failed:", err)
     return false
   } finally {
     button.disabled = false
-    button.textContent = originalLabel || "Download transcripts"
+    button.textContent = originalLabel || "Download transcript"
   }
 }
 
@@ -1609,29 +1543,29 @@ async function bulkDownloadChats(): Promise<void> {
   updateBulkButtons()
 }
 
-async function bulkDownloadMeetings(): Promise<void> {
-  const marked = meetingsState.meetings.filter((m) => markedIds.has(m.id))
+async function bulkDownloadRecordings(): Promise<void> {
+  const marked = recordingsState.recordings.filter((r) => markedIds.has(r.id))
   if (marked.length === 0) return
-  const bulkBtn = el<HTMLButtonElement>("bulk-meetings")
+  const bulkBtn = el<HTMLButtonElement>("bulk-recordings")
   const originalLabel = bulkBtn.textContent
   bulkBtn.disabled = true
   let ok = 0
   let fail = 0
   for (let i = 0; i < marked.length; i++) {
-    const meeting = marked[i]
+    const recording = marked[i]
     bulkBtn.textContent = `Downloading ${i + 1}/${marked.length}…`
     const rowBtn =
       (document.querySelector(
-        `.chat-action[data-event-id="${CSS.escape(meeting.id)}"]`,
+        `.chat-action[data-recording-id="${CSS.escape(recording.id)}"]`,
       ) as HTMLButtonElement | null) ?? document.createElement("button")
-    const success = await downloadMeetingTranscripts(meeting.id, rowBtn)
+    const success = await downloadRecordingTranscript(recording.id, rowBtn)
     if (success) ok++
     else fail++
   }
   bulkBtn.disabled = false
   bulkBtn.textContent = originalLabel || ""
   setStatus(
-    `Bulk meetings complete: ${ok} succeeded${fail > 0 ? `, ${fail} failed` : ""}.`,
+    `Bulk recordings complete: ${ok} succeeded${fail > 0 ? `, ${fail} failed` : ""}.`,
   )
   updateBulkButtons()
 }

@@ -1,0 +1,239 @@
+// Call recordings source -- discovers recordings across all Teams chats by
+// walking /me/chats and extracting callRecordingEventMessageDetail events.
+//
+// This replaces the old calendar-based teams-transcripts.ts source, which
+// couldn't see recordings from 1:1 calls, chat-originated calls, or recordings
+// in other users' OneDrives (anything where the user wasn't the meeting
+// organizer). Chat events surface every recording the user has access to,
+// with a direct SharePoint URL.
+//
+// Transcript fetching uses the same SharePoint REST path as teams-recordings.ts
+// (Graph /shares -> driveItem -> _api/v2.1 with media/transcripts expansion).
+
+import type { PublicClientApplication } from "@azure/msal-browser"
+
+const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+const SCOPES = ["Chat.Read"]
+
+export type ChatType = "oneOnOne" | "group" | "meeting"
+
+export interface RecordingItem {
+  /** Composite primary key: callId::filename. Stable across reloads. */
+  id: string
+  /** Teams call ID -- multiple recordings from the same call share this. */
+  callId: string
+  /** Recording filename (e.g. "Marc Catch-Up-20260526_120954-Meeting Recording.mp4"). */
+  filename: string
+  /** SharePoint sharing URL pointing to the .mp4 in the owner's OneDrive. */
+  url: string
+  /** ISO 8601 duration string (e.g. "PT15M1.826S"). */
+  durationIso: string
+  /** Meeting organizer oid, when set (scheduled meetings have this; 1:1s don't). */
+  organizerOid: string | null
+  /** Who started the recording. */
+  initiatorOid: string | null
+  /** When the recording event was posted (close to when recording finalized). */
+  eventCreatedDateTime: string
+  /** Chat the recording event was posted in. */
+  chatId: string
+  /** Chat topic (null for 1:1s and unnamed group chats). */
+  chatTopic: string | null
+  /** "oneOnOne" | "group" | "meeting". */
+  chatType: ChatType
+}
+
+export interface RecordingsResult {
+  recordings: RecordingItem[]
+  /** Number of chats whose messages we actually scanned. */
+  chatsScanned: number
+  /** Total chats we paged through (including ones outside the window). */
+  chatsTotal: number
+  /** True if we hit the chat-paging cap and there may be more chats unread. */
+  truncated: boolean
+}
+
+interface ChatListItem {
+  id: string
+  topic: string | null
+  chatType: ChatType
+  lastUpdatedDateTime: string
+}
+
+interface ChatMessage {
+  id: string
+  createdDateTime: string
+  eventDetail?: {
+    "@odata.type"?: string
+    callId?: string
+    callRecordingDisplayName?: string
+    callRecordingUrl?: string
+    callRecordingDuration?: string
+    callRecordingStatus?: string
+    meetingOrganizer?: { user?: { id?: string } }
+    initiator?: { user?: { id?: string } }
+  }
+}
+
+async function getGraphToken(
+  msal: PublicClientApplication,
+  scopes: string[],
+): Promise<string> {
+  const account = msal.getActiveAccount()
+  if (!account) throw new Error("No active account")
+  const r = await msal.acquireTokenSilent({ account, scopes })
+  return r.accessToken
+}
+
+async function graphJson<T>(
+  msal: PublicClientApplication,
+  path: string,
+  scopes: string[],
+): Promise<T> {
+  const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`
+  const token = await getGraphToken(msal, scopes)
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) {
+    const body = await resp.text()
+    throw new Error(
+      `Graph ${path}: ${resp.status} ${resp.statusText} \u2014 ${body.slice(0, 300)}`,
+    )
+  }
+  return resp.json() as Promise<T>
+}
+
+export interface ListRecordingsOptions {
+  /** Date window: only chats with activity in the last N days are scanned. */
+  daysBack: number
+  /** Cap chat pagination. Default 10 pages of 50 = up to 500 chats. */
+  maxChatPages?: number
+  /** Progress callback for UI status updates. */
+  onProgress?: (note: string) => void
+}
+
+/**
+ * Discover all call recordings the user has access to within the given date window.
+ *
+ * Algorithm (proven via Probe F in the recording-source investigation spike):
+ *   1. Page through /me/chats. Stop early once the oldest chat in a page is
+ *      older than the window (chats are returned by lastUpdatedDateTime desc).
+ *   2. Filter to chats with recent activity (lastUpdatedDateTime >= window start).
+ *   3. For each such chat, fetch the most recent 50 messages.
+ *   4. Extract messages where eventDetail.@odata.type is
+ *      "#microsoft.graph.callRecordingEventMessageDetail" and status is "success".
+ *   5. Deduplicate by (callId, filename).
+ *   6. Sort by event date descending.
+ *
+ * Catches scheduled meetings, 1:1 calls, group-chat calls, multi-recording calls,
+ * and recordings stored in others' OneDrives. No calendar lookup, no search.
+ */
+export async function listRecordings(
+  msal: PublicClientApplication,
+  options: ListRecordingsOptions,
+): Promise<RecordingsResult> {
+  const { daysBack, maxChatPages = 10, onProgress } = options
+  const sinceMs = Date.now() - daysBack * 24 * 60 * 60 * 1000
+
+  // Phase 1: page through chats
+  let chatsPath: string | null = "/me/chats?$top=50"
+  const allChats: ChatListItem[] = []
+  let pages = 0
+  while (chatsPath && pages < maxChatPages) {
+    onProgress?.(`Listing chats (page ${pages + 1})\u2026`)
+    const page: { value: ChatListItem[]; "@odata.nextLink"?: string } =
+      await graphJson(msal, chatsPath, SCOPES)
+    allChats.push(...page.value)
+    const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
+    if (oldest && new Date(oldest).getTime() < sinceMs) break
+    chatsPath = page["@odata.nextLink"] ?? null
+    pages++
+  }
+  const truncated = chatsPath !== null && pages >= maxChatPages
+
+  const recentChats = allChats.filter((c) => {
+    if (!c.lastUpdatedDateTime) return false
+    return new Date(c.lastUpdatedDateTime).getTime() >= sinceMs
+  })
+
+  // Phase 2: scan messages in each recent chat
+  const hits = new Map<string, RecordingItem>()
+  for (let i = 0; i < recentChats.length; i++) {
+    const chat = recentChats[i]
+    onProgress?.(`Scanning chat ${i + 1}/${recentChats.length}\u2026`)
+    try {
+      const msgs: { value: ChatMessage[] } = await graphJson(
+        msal,
+        `/me/chats/${encodeURIComponent(chat.id)}/messages?$top=50`,
+        SCOPES,
+      )
+      for (const m of msgs.value) {
+        const ed = m.eventDetail
+        if (!ed) continue
+        if (
+          ed["@odata.type"] !==
+            "#microsoft.graph.callRecordingEventMessageDetail" ||
+          ed.callRecordingStatus !== "success" ||
+          !ed.callRecordingUrl
+        )
+          continue
+        const callId = ed.callId ?? "(no-callid)"
+        const filename = ed.callRecordingDisplayName ?? "(unnamed)"
+        const id = `${callId}::${filename}`
+        if (hits.has(id)) continue
+        hits.set(id, {
+          id,
+          callId,
+          filename,
+          url: ed.callRecordingUrl,
+          durationIso: ed.callRecordingDuration ?? "",
+          organizerOid: ed.meetingOrganizer?.user?.id ?? null,
+          initiatorOid: ed.initiator?.user?.id ?? null,
+          eventCreatedDateTime: m.createdDateTime,
+          chatId: chat.id,
+          chatTopic: chat.topic,
+          chatType: chat.chatType,
+        })
+      }
+    } catch (err) {
+      // Bad chat shouldn't kill the whole scan. Log and continue.
+      console.warn(`[m365-pull] Failed to scan chat ${chat.id}:`, err)
+    }
+  }
+
+  const recordings = Array.from(hits.values()).sort((a, b) =>
+    b.eventCreatedDateTime.localeCompare(a.eventCreatedDateTime),
+  )
+
+  return {
+    recordings,
+    chatsScanned: recentChats.length,
+    chatsTotal: allChats.length,
+    truncated,
+  }
+}
+
+/** Parse ISO 8601 duration to seconds (best-effort, handles PT?H?M?S). */
+export function parseDurationSeconds(iso: string): number {
+  if (!iso) return 0
+  const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(
+    iso,
+  )
+  if (!m) return 0
+  const h = parseFloat(m[1] ?? "0")
+  const min = parseFloat(m[2] ?? "0")
+  const s = parseFloat(m[3] ?? "0")
+  return h * 3600 + min * 60 + s
+}
+
+/** Format seconds as "1h 23m" or "23m" or "45s". */
+export function formatDurationShort(iso: string): string {
+  const total = Math.round(parseDurationSeconds(iso))
+  if (total === 0) return ""
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h ${m}m`
+  if (m > 0) return `${m}m`
+  return `${s}s`
+}

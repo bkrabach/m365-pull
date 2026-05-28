@@ -17,7 +17,7 @@ export interface UIState {
     sortKey: SortKey
     markedOnly: boolean
   }
-  meetingFilter?: {
+  recordingFilter?: {
     search: string
     enabledKinds: string[]
     sortKey: SortKey

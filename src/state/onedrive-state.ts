@@ -16,7 +16,7 @@ export interface ChatPrefs {
   lastSync?: string
 }
 
-export interface MeetingPrefs {
+export interface RecordingPrefs {
   /** Last successful transcript download ISO timestamp. */
   lastSync?: string
 }
@@ -32,11 +32,11 @@ export interface AppState {
   version: 1
   updatedAt: string
   updatedBy: string
-  /** Item IDs the user has marked. Holds both chat IDs and meeting event IDs --
-   * the formats don't collide so we keep one set. */
+  /** Item IDs the user has marked. Holds chat IDs and recording IDs
+   * (composite callId::filename) -- distinct keyspaces, same Set. */
   marks: string[]
   chatPrefs?: Record<string, ChatPrefs>
-  meetingPrefs?: Record<string, MeetingPrefs>
+  recordingPrefs?: Record<string, RecordingPrefs>
   /** User-level preferences; sync across devices via this state blob. */
   userPrefs?: UserPrefs
 }
@@ -133,10 +133,10 @@ export function mergeStates(
   }
   // userPrefs: newer wins (single-row config, not additive)
   const userPrefs = newer.userPrefs ?? older.userPrefs
-  // meetingPrefs: per-key spread, same shape as chatPrefs
-  const meetingPrefs: Record<string, MeetingPrefs> = {
-    ...(older.meetingPrefs ?? {}),
-    ...(newer.meetingPrefs ?? {}),
+  // recordingPrefs: per-key spread, same shape as chatPrefs
+  const recordingPrefs: Record<string, RecordingPrefs> = {
+    ...(older.recordingPrefs ?? {}),
+    ...(newer.recordingPrefs ?? {}),
   }
   return {
     version: 1,
@@ -144,7 +144,8 @@ export function mergeStates(
     updatedBy: local.updatedBy || remote.updatedBy,
     marks: [...marks].sort(),
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
-    meetingPrefs: Object.keys(meetingPrefs).length > 0 ? meetingPrefs : undefined,
+    recordingPrefs:
+      Object.keys(recordingPrefs).length > 0 ? recordingPrefs : undefined,
     userPrefs,
   }
 }
