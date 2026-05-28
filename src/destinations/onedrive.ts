@@ -96,6 +96,30 @@ export async function saveToOneDrive(
   path: string,
   data: unknown,
 ): Promise<OneDriveSaveResult> {
+  return saveBytesToOneDrive(
+    msal,
+    path,
+    JSON.stringify(data, null, 2),
+    "application/json",
+  )
+}
+
+/** PUT a raw string (e.g. markdown, text) to a path in the user's OneDrive. */
+export async function saveTextToOneDrive(
+  msal: PublicClientApplication,
+  path: string,
+  content: string,
+  mimeType: string,
+): Promise<OneDriveSaveResult> {
+  return saveBytesToOneDrive(msal, path, content, mimeType)
+}
+
+async function saveBytesToOneDrive(
+  msal: PublicClientApplication,
+  path: string,
+  body: string,
+  contentType: string,
+): Promise<OneDriveSaveResult> {
   const safePath = sanitizePath(path)
   const encoded = safePath
     .split("/")
@@ -110,9 +134,9 @@ export async function saveToOneDrive(
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+        "Content-Type": contentType,
       },
-      body: JSON.stringify(data, null, 2),
+      body,
     })
     if (!response.ok) {
       const body = await response.text()

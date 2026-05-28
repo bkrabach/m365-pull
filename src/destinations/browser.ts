@@ -13,42 +13,65 @@ export interface SaveResult {
   reason?: "cancelled" | "unsupported" | string
 }
 
+interface FilePickerWindow {
+  showSaveFilePicker?: (opts: {
+    suggestedName?: string
+    types?: { description?: string; accept: Record<string, string[]> }[]
+  }) => Promise<{
+    createWritable: () => Promise<{
+      write: (data: string) => Promise<void>
+      close: () => Promise<void>
+    }>
+  }>
+}
+
 /** Save a JS value as JSON via the browser's save-file dialog. */
 export async function saveAsJson(
   suggestedName: string,
   data: unknown,
 ): Promise<SaveResult> {
+  return saveTextFile(suggestedName, JSON.stringify(data, null, 2), {
+    extension: ".json",
+    description: "JSON",
+    mimeType: "application/json",
+  })
+}
+
+/** Save a string as a text file via the browser's save-file dialog. */
+export async function saveAsText(
+  suggestedName: string,
+  content: string,
+  opts: { extension: string; description: string; mimeType: string },
+): Promise<SaveResult> {
+  return saveTextFile(suggestedName, content, opts)
+}
+
+async function saveTextFile(
+  suggestedName: string,
+  content: string,
+  opts: { extension: string; description: string; mimeType: string },
+): Promise<SaveResult> {
   const cleaned = sanitize(suggestedName)
-  const safeName = cleaned.endsWith(".json") ? cleaned : cleaned + ".json"
+  const safeName = cleaned.endsWith(opts.extension)
+    ? cleaned
+    : cleaned + opts.extension
 
-  const w = window as unknown as {
-    showSaveFilePicker?: (opts: {
-      suggestedName?: string
-      types?: { description?: string; accept: Record<string, string[]> }[]
-    }) => Promise<{
-      createWritable: () => Promise<{
-        write: (data: string) => Promise<void>
-        close: () => Promise<void>
-      }>
-    }>
-  }
-
+  const w = window as unknown as FilePickerWindow
   if (!w.showSaveFilePicker) {
     return { saved: false, reason: "unsupported" }
   }
-
   try {
     const handle = await w.showSaveFilePicker({
       suggestedName: safeName,
       types: [
         {
-          description: "JSON",
-          accept: { "application/json": [".json"] },
+          description: opts.description,
+          accept: { [opts.mimeType]: [opts.extension] },
         },
       ],
     })
     const writable = await handle.createWritable()
-    await writable.write(JSON.stringify(data, null, 2))
+    await writable.write(content)
     await writable.close()
     return { saved: true }
   } catch (err) {

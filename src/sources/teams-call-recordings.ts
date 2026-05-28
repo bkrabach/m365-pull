@@ -17,6 +17,15 @@ const SCOPES = ["Chat.Read"]
 
 export type ChatType = "oneOnOne" | "group" | "meeting"
 
+export interface Participant {
+  /** Display name (may be empty for some bot/app participants). */
+  displayName: string
+  /** Entra oid for users; app id for bot/app participants. */
+  id: string | null
+  /** "user" for human users, "bot" for app/bot identities. */
+  kind: "user" | "bot"
+}
+
 export interface RecordingItem {
   /** Composite primary key: callId::filename. Stable across reloads. */
   id: string
@@ -40,6 +49,10 @@ export interface RecordingItem {
   chatTopic: string | null
   /** "oneOnOne" | "group" | "meeting". */
   chatType: ChatType
+  /** Participants list from the matching callEndedEventMessageDetail event in
+   * the same chat (joined by callId). Empty when no callEnded event was seen
+   * (e.g. the chat was scanned beyond the message that carried it). */
+  participants: Participant[]
 }
 
 export interface RecordingsResult {
@@ -71,7 +84,45 @@ interface ChatMessage {
     callRecordingStatus?: string
     meetingOrganizer?: { user?: { id?: string } }
     initiator?: { user?: { id?: string } }
+    /** Present on callEndedEventMessageDetail events. */
+    callParticipants?: {
+      participant?: {
+        user?: { displayName?: string; id?: string }
+        application?: { displayName?: string; id?: string }
+      }
+    }[]
   }
+}
+
+function extractParticipants(
+  cp: NonNullable<ChatMessage["eventDetail"]>["callParticipants"],
+): Participant[] {
+  if (!cp) return []
+  const out: Participant[] = []
+  const seen = new Set<string>()
+  for (const entry of cp) {
+    const p = entry.participant
+    if (!p) continue
+    let displayName = ""
+    let id: string | null = null
+    let kind: "user" | "bot" = "user"
+    if (p.user) {
+      displayName = (p.user.displayName ?? "").trim()
+      id = p.user.id ?? null
+      kind = "user"
+    } else if (p.application) {
+      displayName = (p.application.displayName ?? "").trim() || "(bot)"
+      id = p.application.id ?? null
+      kind = "bot"
+    } else {
+      continue
+    }
+    const key = id ?? `${kind}::${displayName}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ displayName, id, kind })
+  }
+  return out
 }
 
 async function getGraphToken(
@@ -156,8 +207,12 @@ export async function listRecordings(
     return new Date(c.lastUpdatedDateTime).getTime() >= sinceMs
   })
 
-  // Phase 2: scan messages in each recent chat
+  // Phase 2: scan messages in each recent chat. Collect both:
+  //   - callRecordingEventMessageDetail with status:"success" -> recordings
+  //   - callEndedEventMessageDetail                            -> participants by callId
+  // Join client-side -- a single chat carries both event types for a given call.
   const hits = new Map<string, RecordingItem>()
+  const participantsByCallId = new Map<string, Participant[]>()
   for (let i = 0; i < recentChats.length; i++) {
     const chat = recentChats[i]
     onProgress?.(`Scanning chat ${i + 1}/${recentChats.length}\u2026`)
@@ -170,35 +225,54 @@ export async function listRecordings(
       for (const m of msgs.value) {
         const ed = m.eventDetail
         if (!ed) continue
+        const t = ed["@odata.type"]
         if (
-          ed["@odata.type"] !==
-            "#microsoft.graph.callRecordingEventMessageDetail" ||
-          ed.callRecordingStatus !== "success" ||
-          !ed.callRecordingUrl
-        )
-          continue
-        const callId = ed.callId ?? "(no-callid)"
-        const filename = ed.callRecordingDisplayName ?? "(unnamed)"
-        const id = `${callId}::${filename}`
-        if (hits.has(id)) continue
-        hits.set(id, {
-          id,
-          callId,
-          filename,
-          url: ed.callRecordingUrl,
-          durationIso: ed.callRecordingDuration ?? "",
-          organizerOid: ed.meetingOrganizer?.user?.id ?? null,
-          initiatorOid: ed.initiator?.user?.id ?? null,
-          eventCreatedDateTime: m.createdDateTime,
-          chatId: chat.id,
-          chatTopic: chat.topic,
-          chatType: chat.chatType,
-        })
+          t === "#microsoft.graph.callRecordingEventMessageDetail" &&
+          ed.callRecordingStatus === "success" &&
+          ed.callRecordingUrl
+        ) {
+          const callId = ed.callId ?? "(no-callid)"
+          const filename = ed.callRecordingDisplayName ?? "(unnamed)"
+          const id = `${callId}::${filename}`
+          if (!hits.has(id)) {
+            hits.set(id, {
+              id,
+              callId,
+              filename,
+              url: ed.callRecordingUrl,
+              durationIso: ed.callRecordingDuration ?? "",
+              organizerOid: ed.meetingOrganizer?.user?.id ?? null,
+              initiatorOid: ed.initiator?.user?.id ?? null,
+              eventCreatedDateTime: m.createdDateTime,
+              chatId: chat.id,
+              chatTopic: chat.topic,
+              chatType: chat.chatType,
+              participants: [],
+            })
+          }
+        } else if (
+          t === "#microsoft.graph.callEndedEventMessageDetail" &&
+          ed.callId
+        ) {
+          // Latest participants list wins (later messages overwrite earlier).
+          // For the same call, all callEnded events should carry the same list,
+          // but we keep the last-seen one to be defensive about Teams variations.
+          const parts = extractParticipants(ed.callParticipants)
+          if (parts.length > 0) {
+            participantsByCallId.set(ed.callId, parts)
+          }
+        }
       }
     } catch (err) {
       // Bad chat shouldn't kill the whole scan. Log and continue.
       console.warn(`[m365-pull] Failed to scan chat ${chat.id}:`, err)
     }
+  }
+
+  // Phase 3: join participants into recordings by callId
+  for (const rec of hits.values()) {
+    const parts = participantsByCallId.get(rec.callId)
+    if (parts) rec.participants = parts
   }
 
   const recordings = Array.from(hits.values()).sort((a, b) =>

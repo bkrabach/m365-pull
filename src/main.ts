@@ -18,8 +18,9 @@ import {
   resolveRecordingFromUrl,
   fetchRecordingTranscripts,
 } from "./sources/teams-recordings"
-import { saveAsJson } from "./destinations/browser"
-import { saveToOneDrive, loadFromOneDrive } from "./destinations/onedrive"
+import { vttToMarkdown } from "./format/transcript-markdown"
+import { saveAsJson, saveAsText } from "./destinations/browser"
+import { saveToOneDrive, saveTextToOneDrive, loadFromOneDrive } from "./destinations/onedrive"
 import {
   loadUserPrefs,
   saveUserPrefs,
@@ -1218,12 +1219,30 @@ function renderRecordingRow(r: RecordingItem): string {
     r.chatType === "oneOnOne" ? "1:1" : r.chatType === "group" ? "Group" : "Meeting"
   const initiatorTag = youInitiated ? " · you started" : ""
   const sub = `${start} · ${kindLabel}${dur ? ` · ${dur}` : ""}${initiatorTag}${downloadedTag}`
+
+  // Participants line. Show up to 4 names; "+N more" beyond that. Skip self by
+  // oid match. Bots labeled with parens to disambiguate from human names.
+  let participantsLine = ""
+  if (r.participants.length > 0) {
+    const others = r.participants.filter(
+      (p) => !(userOid && p.id && p.id.toLowerCase() === userOid),
+    )
+    const labels = others.map((p) =>
+      p.kind === "bot" ? `(${p.displayName})` : p.displayName,
+    )
+    const visible = labels.slice(0, 4)
+    const extra = labels.length - visible.length
+    const tail = extra > 0 ? `, +${extra} more` : ""
+    participantsLine = `With ${visible.join(", ")}${tail}`
+  }
+
   return `
     <li class="chat-row${isMarked ? " marked" : ""}">
       <button class="mark-toggle${isMarked ? " marked" : ""}" data-recording-id="${escapeHtml(r.id)}" title="${isMarked ? "Unmark" : "Mark"} this recording" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "★" : "☆"}</button>
       <div class="chat-info">
         <div class="chat-name">${escapeHtml(title)}</div>
         <div class="chat-sub">${escapeHtml(sub)}</div>
+        ${participantsLine ? `<div class="chat-participants">${escapeHtml(participantsLine)}</div>` : ""}
       </div>
       <button class="chat-action" data-recording-id="${escapeHtml(r.id)}">Download transcript</button>
     </li>
@@ -1456,28 +1475,61 @@ async function downloadRecordingTranscript(
     }
     button.textContent = "Saving…"
     const stableName = recording.id.replace(/[^a-zA-Z0-9]/g, "")
-    const filename = `recording-transcript-${stableName}.json`
+    const filename = `recording-transcript-${stableName}.md`
     const destination = userPrefs.destination
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
-    const archivePayload = {
-      ...payload,
-      recordingId: recording.id,
-      callId: recording.callId,
-      filename: recording.filename,
-      chatId: recording.chatId,
-      chatTopic: recording.chatTopic,
-      chatType: recording.chatType,
-      url: recording.url,
-      durationIso: recording.durationIso,
-      organizerOid: recording.organizerOid,
-      initiatorOid: recording.initiatorOid,
-      eventCreatedDateTime: recording.eventCreatedDateTime,
+
+    // Concat all VTT bodies (some recordings carry multiple transcripts) into
+    // one combined markdown document. Single-transcript case is the common
+    // path; the concat produces the same output as a direct vttToMarkdown call.
+    const combinedVtt = payload.transcripts
+      .map((t) => t.content)
+      .join("\n\n")
+    const attendees =
+      recording.participants.length > 0
+        ? recording.participants
+            .filter((p) => p.kind === "user")
+            .map((p) => p.displayName)
+            .filter(Boolean)
+            .join(", ")
+        : ""
+    const dateLabel = formatDate(recording.eventCreatedDateTime)
+    const kindLabel =
+      recording.chatType === "oneOnOne"
+        ? "1:1"
+        : recording.chatType === "group"
+          ? "Group"
+          : "Meeting"
+    const metadata = [
+      { label: "Date", value: dateLabel },
+      { label: "Chat type", value: kindLabel },
+    ]
+    if (recording.callId) {
+      metadata.push({ label: "Call ID", value: recording.callId })
     }
+    if (attendees) {
+      metadata.push({ label: "Attendees", value: attendees })
+    }
+    const markdownBody = vttToMarkdown(combinedVtt, {
+      title: subject,
+      sourceUrl: recording.url,
+      metadata,
+    })
+
     if (destination === "onedrive") {
       const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${filename}`
-      result = await saveToOneDrive(msal, fullPath, archivePayload)
+      result = await saveTextToOneDrive(
+        msal,
+        fullPath,
+        markdownBody,
+        "text/markdown",
+      )
     } else {
-      result = await saveAsJson(filename, archivePayload)
+      result = await saveAsText(filename, markdownBody, {
+        extension: ".md",
+        description: "Markdown",
+        mimeType: "text/markdown",
+      })
     }
     if (result.saved) {
       recordingPrefs = {
