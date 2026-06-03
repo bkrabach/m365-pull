@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Personal M365 content archive. See ../docs/designs/m365-pull-design.md",
+  "description": "Static SPA for downloading Teams chats and call recordings from a single M365 tenant, with OneDrive sync for cross-device access.",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

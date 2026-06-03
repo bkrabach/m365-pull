@@ -2,7 +2,7 @@
 
 A static SPA for downloading Teams chats and other M365 content from a single Microsoft tenant, with optional OneDrive sync for cross-device access.
 
-- **Status:** working — two sources (Teams chats, Teams meeting transcripts), browser + OneDrive destinations, cross-device state via OneDrive
+- **Status:** working — two sources (Teams chats, call recordings + transcripts), browser + OneDrive destinations, cross-device state via OneDrive
 - **Maintainer:** TBD *(set before sharing beyond yourself)*
 
 ## What it does
@@ -10,7 +10,7 @@ A static SPA for downloading Teams chats and other M365 content from a single Mi
 A static SPA that lets a signed-in M365 user pull selected content from their own tenant to local files or to their OneDrive.
 
 - **Teams chats** — list, search/filter/sort, mark for sync, per-chat lookback windows, incremental delta-sync, cumulative archive
-- **Teams meeting transcripts** — list calendar meetings, locate the recording via Microsoft Graph search, fetch its transcript via SharePoint REST (works for meetings you attended, not just ones you organized)
+- **Call recordings** — discover all recordings you have access to by walking `/me/chats` and extracting `callRecordingEventMessageDetail` events (catches 1:1s, group chats, and scheduled meetings), then fetch transcripts via SharePoint REST
 - **Destinations** — browser save dialog, or a configured OneDrive folder that syncs across all your devices
 - **State** — marks, lastSync timestamps, and user preferences live in `/Apps/m365-pull/state.json` in your OneDrive. Sign in on another device and your view carries over.
 - **No backend** — pure SPA. Tokens are MSAL.js-managed in the browser. Graph and SharePoint REST are called directly from the page.
@@ -30,13 +30,18 @@ A static SPA that lets a signed-in M365 user pull selected content from their ow
    - Platform: **Single-page application (SPA)**
    - URI: `http://localhost:5173`
 5. After creation, go to **Authentication** and (later) add any other URLs you'll run the dev server from (e.g. `http://192.168.x.x:5173` for LAN testing) and your deployed SWA URL as additional SPA redirect URIs.
-6. Go to **API permissions** → add **Microsoft Graph → Delegated** permissions for what you intend to use:
-   - `User.Read` (sign-in, profile)
-   - `Chat.Read`, `Chat.ReadBasic` (Teams chats source)
-   - `Calendars.Read`, `OnlineMeetings.Read`, `Files.Read.All`, `Sites.Read.All` (Teams meeting transcripts source)
+6. Go to **API permissions** and add the following:
+
+   **Microsoft Graph → Delegated:**
+   - `User.Read` (sign-in, read profile)
+   - `Chat.Read` (Teams chats and call-recording events source)
+   - `Files.Read.All` (resolve SharePoint sharing URLs for recordings)
    - `Files.ReadWrite.AppFolder` (cross-device state in OneDrive)
    - `Files.ReadWrite` (OneDrive destination, if you'll use it)
-   - `offline_access` (token refresh)
+   - `offline_access`, `openid`, `profile` (MSAL sign-in and token refresh)
+
+   **Office 365 SharePoint Online → Delegated:**
+   - `Sites.Read.All` (acquire a SharePoint resource token to fetch transcript files via SharePoint REST)
 
    Then click **Grant admin consent for [your tenant]**. Some permissions need admin approval — file a request with your tenant admin if you don't have it.
 7. From the **Overview** tab, copy:

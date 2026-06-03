@@ -92,26 +92,6 @@ export async function listChatsPage(
   }
 }
 
-/** List the user's Teams chats. Pages through all results.
- *
- * Convenience wrapper over `listChatsPage` for callers that want the whole
- * list at once. The `onProgress` callback fires after each page lands, with
- * the running total.
- */
-export async function listChats(
-  msal: PublicClientApplication,
-  onProgress?: (count: number) => void,
-): Promise<TeamsChatItem[]> {
-  const out: TeamsChatItem[] = []
-  let cursor: string | null = null
-  do {
-    const page = await listChatsPage(msal, cursor)
-    out.push(...page.chats)
-    onProgress?.(out.length)
-    cursor = page.nextCursor
-  } while (cursor)
-  return out
-}
 
 export interface FetchProgress {
   count: number

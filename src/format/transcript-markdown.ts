@@ -27,14 +27,14 @@ const VTT_ENTITIES: Record<string, string> = {
   "&nbsp;": " ",
 }
 
-export interface Cue {
+interface Cue {
   start: number
   end: number
   speaker: string | null
   text: string
 }
 
-export interface RenderOptions {
+interface RenderOptions {
   /** Title shown in the H1. */
   title: string
   /** "Source:" line — the SharePoint URL or human-readable origin. */
@@ -78,7 +78,7 @@ function vttCleanPayload(raw: string): { speaker: string | null; text: string } 
 }
 
 /** Parse a WEBVTT body into Cue objects. Tolerant of missing optional fields. */
-export function parseVtt(content: string): Cue[] {
+function parseVtt(content: string): Cue[] {
   const lines = content.split(/\r?\n/)
   const cues: Cue[] = []
   let i = 0
@@ -122,7 +122,7 @@ function overlapTrim(prevText: string, nextText: string, maxWords = 12): string 
 }
 
 /** Merge adjacent cues from the same speaker, with overlap trimming. */
-export function mergeConsecutive(cues: Cue[]): Cue[] {
+function mergeConsecutive(cues: Cue[]): Cue[] {
   const out: Cue[] = []
   for (const c of cues) {
     const prev = out[out.length - 1]
@@ -148,7 +148,7 @@ function formatTs(sec: number, withHours: boolean): string {
 }
 
 /** Render cues as LLM-friendly markdown. Matches teams-transcript-md output. */
-export function renderMarkdown(cues: Cue[], options: RenderOptions): string {
+function renderMarkdown(cues: Cue[], options: RenderOptions): string {
   const {
     title,
     sourceUrl,

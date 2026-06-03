@@ -25,17 +25,6 @@ interface FilePickerWindow {
   }>
 }
 
-/** Save a JS value as JSON via the browser's save-file dialog. */
-export async function saveAsJson(
-  suggestedName: string,
-  data: unknown,
-): Promise<SaveResult> {
-  return saveTextFile(suggestedName, JSON.stringify(data, null, 2), {
-    extension: ".json",
-    description: "JSON",
-    mimeType: "application/json",
-  })
-}
 
 /** Save a string as a text file via the browser's save-file dialog. */
 export async function saveAsText(
