@@ -10,9 +10,7 @@ const STATE_PATH = "/me/drive/special/approot:/state.json:/content"
 const SCOPES = ["Files.ReadWrite.AppFolder"]
 
 export interface ChatPrefs {
-  /** Per-chat lookback override; honored at download time. */
-  lookbackDays?: number | "all"
-  /** Last successful sync ISO timestamp; foundation for P6 delta-sync. */
+  /** ISO timestamp of the last successful chat sync for this chat. */
   lastSync?: string
 }
 
@@ -39,15 +37,6 @@ export interface AppState {
   recordingPrefs?: Record<string, RecordingPrefs>
   /** User-level preferences; sync across devices via this state blob. */
   userPrefs?: UserPrefs
-}
-
-export function emptyState(): AppState {
-  return {
-    version: 1,
-    updatedAt: new Date(0).toISOString(),
-    updatedBy: "",
-    marks: [],
-  }
 }
 
 async function getToken(

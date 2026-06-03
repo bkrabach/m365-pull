@@ -1,13 +1,11 @@
-// Call recordings source -- discovers recordings across all Teams chats by
-// walking /me/chats and extracting callRecordingEventMessageDetail events.
+// Call recordings source -- discovers recordings by walking /me/chats and
+// extracting callRecordingEventMessageDetail events.
 //
-// This replaces the old calendar-based teams-transcripts.ts source, which
-// couldn't see recordings from 1:1 calls, chat-originated calls, or recordings
-// in other users' OneDrives (anything where the user wasn't the meeting
-// organizer). Chat events surface every recording the user has access to,
-// with a direct SharePoint URL.
+// Catches scheduled meetings, 1:1 calls, group-chat calls, and recordings
+// stored in any accessible OneDrive -- every recording the signed-in user
+// has access to, identified by a direct SharePoint URL in the event payload.
 //
-// Transcript fetching uses the same SharePoint REST path as teams-recordings.ts
+// Transcript fetching uses the SharePoint REST v2.1 path in teams-recordings.ts
 // (Graph /shares -> driveItem -> _api/v2.1 with media/transcripts expansion).
 
 import type { PublicClientApplication } from "@azure/msal-browser"
@@ -16,6 +14,15 @@ const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const SCOPES = ["Chat.Read"]
 // Members listing requires ChatMember.Read (subset of Chat.Read in some tenants;
 // kept explicit so the token request is clear).
+
+// Graph's chat-level lastUpdatedDateTime is known-unreliable: it doesn't bump
+// for every new message, especially in 1:1s.  We widen the chat scan window by
+// this buffer so chats with stale timestamps that still contain in-window
+// recordings aren't pruned before their messages are scanned.  The recording's
+// own createdDateTime (filtered in the message-scan loop below) is the true
+// correctness gate; this buffer is a performance/coverage safety net only.
+// 30 days covers the worst-case staleness observed in production.
+const CHAT_WINDOW_BUFFER_MS = 30 * 24 * 60 * 60 * 1000
 
 
 export type ChatType = "oneOnOne" | "group" | "meeting"
@@ -62,8 +69,6 @@ export interface RecordingsResult {
   recordings: RecordingItem[]
   /** Number of chats whose messages we actually scanned. */
   chatsScanned: number
-  /** Total chats we paged through (including ones outside the window). */
-  chatsTotal: number
   /** True if we hit the chat-paging cap and there may be more chats unread. */
   truncated: boolean
 }
@@ -158,7 +163,9 @@ async function graphJson<T>(
 }
 
 export interface ListRecordingsOptions {
-  /** Date window: only chats with activity in the last N days are scanned. */
+  /** Date window: return recordings whose event date falls within the last N days.
+   * Chats are scanned over a wider window (N + 30 days) to compensate for
+   * Graph's stale lastUpdatedDateTime — see CHAT_WINDOW_BUFFER_MS. */
   daysBack: number
   /** Cap chat pagination. Default 10 pages of 50 = up to 500 chats. */
   maxChatPages?: number
@@ -171,11 +178,15 @@ export interface ListRecordingsOptions {
  *
  * Algorithm (proven via Probe F in the recording-source investigation spike):
  *   1. Page through /me/chats. Stop early once the oldest chat in a page is
- *      older than the window (chats are returned by lastUpdatedDateTime desc).
- *   2. Filter to chats with recent activity (lastUpdatedDateTime >= window start).
+ *      older than the window PLUS a 30-day buffer (Graph's lastUpdatedDateTime
+ *      is known-stale — see CHAT_WINDOW_BUFFER_MS).
+ *   2. Filter to chats active within the widened window.
  *   3. For each such chat, fetch the most recent 50 messages.
  *   4. Extract messages where eventDetail.@odata.type is
- *      "#microsoft.graph.callRecordingEventMessageDetail" and status is "success".
+ *      "#microsoft.graph.callRecordingEventMessageDetail", status is "success",
+ *      AND the recording's own createdDateTime >= window start.  (The recording
+ *      date is the authoritative correctness gate; the chat window in steps 1–2
+ *      is a performance optimisation only.)
  *   5. Deduplicate by (callId, filename).
  *   6. Sort by event date descending.
  *
@@ -188,6 +199,11 @@ export async function listRecordings(
 ): Promise<RecordingsResult> {
   const { daysBack, maxChatPages = 10, onProgress } = options
   const sinceMs = Date.now() - daysBack * 24 * 60 * 60 * 1000
+  // Widen the chat scan window beyond sinceMs so chats with stale
+  // lastUpdatedDateTime (see CHAT_WINDOW_BUFFER_MS) aren't excluded before
+  // their messages are checked.  sinceMs is still the correctness gate —
+  // applied per-recording inside the message scan loop below.
+  const chatSinceMs = sinceMs - CHAT_WINDOW_BUFFER_MS
 
   // Phase 1: page through chats
   let chatsPath: string | null = "/me/chats?$top=50"
@@ -199,7 +215,7 @@ export async function listRecordings(
       await graphJson(msal, chatsPath, SCOPES)
     allChats.push(...page.value)
     const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
-    if (oldest && new Date(oldest).getTime() < sinceMs) break
+    if (oldest && new Date(oldest).getTime() < chatSinceMs) break
     chatsPath = page["@odata.nextLink"] ?? null
     pages++
   }
@@ -207,7 +223,7 @@ export async function listRecordings(
 
   const recentChats = allChats.filter((c) => {
     if (!c.lastUpdatedDateTime) return false
-    return new Date(c.lastUpdatedDateTime).getTime() >= sinceMs
+    return new Date(c.lastUpdatedDateTime).getTime() >= chatSinceMs
   })
 
   // Phase 2: scan messages in each recent chat. Collect both:
@@ -234,6 +250,13 @@ export async function listRecordings(
           ed.callRecordingStatus === "success" &&
           ed.callRecordingUrl
         ) {
+          // Part 1: filter by the recording's own date — the authoritative
+          // window gate.  Without this, a recording event from years ago
+          // appears whenever its chat passes the chat-level activity filter
+          // (e.g. a sparse 1:1 that was recently active but whose last 50
+          // messages span years).  m.createdDateTime is the timestamp of
+          // the recording event itself, not the chat's lastUpdatedDateTime.
+          if (new Date(m.createdDateTime).getTime() < sinceMs) continue
           const callId = ed.callId ?? "(no-callid)"
           const filename = ed.callRecordingDisplayName ?? "(unnamed)"
           const id = `${callId}::${filename}`
@@ -337,7 +360,6 @@ export async function listRecordings(
   return {
     recordings,
     chatsScanned: recentChats.length,
-    chatsTotal: allChats.length,
     truncated,
   }
 }
@@ -404,7 +426,7 @@ export function buildTranscriptFilename(
 }
 
 /** Parse ISO 8601 duration to seconds (best-effort, handles PT?H?M?S). */
-export function parseDurationSeconds(iso: string): number {
+function parseDurationSeconds(iso: string): number {
   if (!iso) return 0
   const m = /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(
     iso,

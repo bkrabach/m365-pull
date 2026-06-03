@@ -16,11 +16,6 @@ export interface OneDriveSaveResult {
   webUrl?: string
 }
 
-export interface OneDriveLoadResult<T> {
-  found: boolean
-  data?: T
-  reason?: string
-}
 
 async function getToken(
   msal: PublicClientApplication,
@@ -47,61 +42,6 @@ function sanitizePath(rawPath: string): string {
     )
     .filter(Boolean)
   return "/" + cleaned.join("/")
-}
-
-/** Load a JSON value from a path in the user's OneDrive.
- *
- * Returns `{ found: false }` on 404 (file doesn't exist yet).
- * Throws-into-result on other errors.
- */
-export async function loadFromOneDrive<T = unknown>(
-  msal: PublicClientApplication,
-  path: string,
-): Promise<OneDriveLoadResult<T>> {
-  const safePath = sanitizePath(path)
-  const encoded = safePath
-    .split("/")
-    .filter(Boolean)
-    .map(encodeURIComponent)
-    .join("/")
-  const url = `${GRAPH_BASE}/me/drive/root:/${encoded}:/content`
-
-  try {
-    const token = await getToken(msal, SCOPES)
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (response.status === 404) return { found: false }
-    if (!response.ok) {
-      const body = await response.text()
-      return {
-        found: false,
-        reason: `${response.status} ${response.statusText} — ${body.slice(0, 300)}`,
-      }
-    }
-    const data = (await response.json()) as T
-    return { found: true, data }
-  } catch (err) {
-    return { found: false, reason: (err as Error).message }
-  }
-}
-
-/** Save a JS value as JSON to a path in the user's OneDrive.
- *
- * Graph PUT to /me/drive/root:/path/to/file:/content auto-creates any
- * missing parent directories along the way.
- */
-export async function saveToOneDrive(
-  msal: PublicClientApplication,
-  path: string,
-  data: unknown,
-): Promise<OneDriveSaveResult> {
-  return saveBytesToOneDrive(
-    msal,
-    path,
-    JSON.stringify(data, null, 2),
-    "application/json",
-  )
 }
 
 /** PUT a raw string (e.g. markdown, text) to a path in the user's OneDrive. */

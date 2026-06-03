@@ -1,17 +1,29 @@
 # Amplifier Online - Azure Static Web App Stack Configuration
-# Documentation: https://github.com/payneio/amplifier-online/blob/main/docs/stacks/static-web-app.md
+# Documentation: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
 
 name: m365-pull
 stack: static-web-app
 
 # Static frontend (built and deployed by GitHub Actions)
+#
+# Auth options:
+#   protected: login | false
+#     - login: Require sign-in for all routes (configure via staticwebapp.config.json)
+#     - false: No authentication required (default)
+#   auth: true | false
+#     - true:  Register AAD app and inject AZURE_CLIENT_ID for MSAL.js token acquisition
+#     - false: No AAD identity needed (default)
+#   Note: protected != false creates the app registration automatically, but
+#     auth: true is still needed if the SPA acquires its own tokens via MSAL.js.
 frontend:
   type: static-web-app
-  repo: "https://github.com/bkrabach/m365-pull"
+  repo: "https://github.com/bkrabach/m365-pull"  # REQUIRED: GitHub repo URL
   branch: main
   app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
   output_location: "dist"  # Build output directory (must match vite/webpack/next config)
   build_command: "npm run build"  # Optional - defaults to "npm run build"
+  protected: false  # Set to "login" to require sign-in
+  # auth: true     # Uncomment if your SPA needs MSAL.js token acquisition
 
 # Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
 # Need backend API? Use web-app-awa (Web App + Static Web App)
@@ -42,4 +54,4 @@ frontend:
 # - Build fails? Check GitHub Actions logs and match Node version locally
 # - Wrong files deployed? Verify output_location matches your build output directory
 #
-# Need help? See: https://github.com/payneio/amplifier-online/blob/main/docs/stacks/static-web-app.md
+# Need help? See: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md

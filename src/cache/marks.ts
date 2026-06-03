@@ -1,10 +1,9 @@
 // Persistent set of "marked" chat IDs (the in-app favorite/pin replacement
 // for Teams sidebar organization, which Graph doesn't expose).
 //
-// v0 lives in localStorage keyed by user. When P5 (OneDrive AppFolder state)
-// lands, this becomes part of the per-user state.json blob in OneDrive so
-// marks sync across devices. The MarksData shape will grow to include
-// per-chat lookback overrides and lastSync timestamps at that point.
+// Marks are stored in localStorage for instant reads on load and synced to
+// OneDrive state.json (the source of truth) for cross-device persistence.
+// The OneDrive sync merges marks additively so no marks are lost across devices.
 
 const KEY_PREFIX = "m365-pull.marks.v1."
 
