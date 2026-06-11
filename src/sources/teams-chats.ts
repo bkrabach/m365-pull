@@ -146,6 +146,32 @@ export async function listChatsPage(
 }
 
 
+/** Fetch a single chat by ID, expanding slim members (displayName-only).
+ *
+ * Returns null on 404 (deleted / no longer accessible) so callers can fail
+ * soft without aborting the overall load. All other errors are re-thrown.
+ */
+export async function fetchChatById(
+  msal: PublicClientApplication,
+  chatId: string,
+): Promise<TeamsChatItem | null> {
+  try {
+    const chat = await graphGet<TeamsChatItem>(
+      msal,
+      `/me/chats/${encodeURIComponent(chatId)}?$expand=members`,
+      ["Chat.Read"],
+    )
+    return {
+      ...chat,
+      members: chat.members?.map((m) => ({ displayName: m.displayName })),
+    }
+  } catch (err) {
+    // 404 = deleted or no longer accessible; return null so caller can skip.
+    if ((err as Error).message.includes("404")) return null
+    throw err
+  }
+}
+
 export interface FetchProgress {
   count: number
   /** Oldest createdDateTime seen so far across all fetched pages. */

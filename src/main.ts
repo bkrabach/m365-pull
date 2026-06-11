@@ -3,6 +3,7 @@ import { config } from "./config"
 import "./style.css"
 import {
   listChatsPage,
+  fetchChatById,
   fetchChatMessages,
   chatDisplayName,
   buildChatArchiveFilename,
@@ -28,6 +29,7 @@ import {
   saveUserPrefs,
   type UserPrefs,
   type Destination,
+  type ChatRange,
 } from "./cache/prefs"
 import {
   loadCachedChats,
@@ -238,6 +240,64 @@ function rangeLabel(range: RecordingRange): string {
   }
 }
 
+// ----- Chat range helpers -----
+
+/** Most recent chatPrefs.lastSync timestamp across all synced chats, or null. */
+function mostRecentChatSync(prefs: Record<string, { lastSync?: string }>): number | null {
+  let most: number | null = null
+  for (const v of Object.values(prefs)) {
+    if (v.lastSync) {
+      const t = Date.parse(v.lastSync)
+      if (!isNaN(t) && (most === null || t > most)) most = t
+    }
+  }
+  return most
+}
+
+/** Map a persisted ChatRange to a concrete [cutoffMs, untilMs] window.
+ *  For since-last-download with no prior sync, falls back to last-7d. */
+function computeChatWindow(
+  range: ChatRange,
+  prefs: Record<string, { lastSync?: string }>,
+): { cutoffMs: number; untilMs: number } {
+  const now = Date.now()
+  switch (range.kind) {
+    case "this-week":
+      return { cutoffMs: startOfThisWeekMonday(), untilMs: now }
+    case "last-7d":
+      return { cutoffMs: now - 7 * DAY_MS, untilMs: now }
+    case "last-30d":
+      return { cutoffMs: now - 30 * DAY_MS, untilMs: now }
+    case "since-last-download": {
+      const t = mostRecentChatSync(prefs)
+      return { cutoffMs: t !== null ? t : now - 7 * DAY_MS, untilMs: now }
+    }
+    case "custom": {
+      const cutoffMs = range.customFrom ? startOfLocalDay(range.customFrom) : now - 7 * DAY_MS
+      const untilMs = range.customTo ? endOfLocalDay(range.customTo) : now
+      return { cutoffMs, untilMs }
+    }
+  }
+}
+
+/** Human-readable label for a ChatRange (used in status messages). */
+function chatRangeLabel(range: ChatRange, prefs: Record<string, { lastSync?: string }>): string {
+  switch (range.kind) {
+    case "this-week": return "this week"
+    case "last-7d": return "last 7 days"
+    case "last-30d": return "last 30 days"
+    case "since-last-download": {
+      const t = mostRecentChatSync(prefs)
+      if (t === null) return "since last download (none yet \u2014 showing 7 days)"
+      return `since last download (${formatDateShort(new Date(t))})`
+    }
+    case "custom":
+      if (range.customFrom && range.customTo) return `${range.customFrom} to ${range.customTo}`
+      if (range.customFrom) return `from ${range.customFrom}`
+      return "custom range"
+  }
+}
+
 function setStatus(text: string, kind: "info" | "error" = "info"): void {
   const status = el<HTMLDivElement>("status")
   status.textContent = text
@@ -276,6 +336,24 @@ function syncUserPrefsToUI(): void {
     if (fromEl && range.customFrom) fromEl.value = range.customFrom
     if (toEl && range.customTo) toEl.value = range.customTo
   }
+
+  // Chat range
+  const chatRange: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
+  const chatRangeEl = document.getElementById("chat-range") as HTMLSelectElement | null
+  if (chatRangeEl) chatRangeEl.value = chatRange.kind
+  const chatCustomEl = document.getElementById("chat-custom-range-inputs") as HTMLSpanElement | null
+  if (chatCustomEl) chatCustomEl.hidden = chatRange.kind !== "custom"
+  if (chatRange.kind === "custom") {
+    const chatFromEl = document.getElementById("chat-from") as HTMLInputElement | null
+    const chatToEl = document.getElementById("chat-to") as HTMLInputElement | null
+    if (chatFromEl && chatRange.customFrom) chatFromEl.value = chatRange.customFrom
+    if (chatToEl && chatRange.customTo) chatToEl.value = chatRange.customTo
+  }
+
+  // Marked-include toggle (default ON: undefined → true)
+  const markedIncludeBtn = document.getElementById("marked-include") as HTMLButtonElement | null
+  if (markedIncludeBtn)
+    markedIncludeBtn.classList.toggle("active", userPrefs.markedInclude !== false)
 
   // Hide-downloaded toggle
   const hideBtn = document.getElementById("hide-downloaded") as HTMLButtonElement | null
@@ -601,8 +679,23 @@ function render(): void {
       <div class="actions" id="actions-chats">
         <button id="loadchats" class="primary">Load my Teams chats</button>
         <button id="refreshchats" hidden>Refresh</button>
-        <span class="label">Lookback:</span>
-        <select id="lookback" title="Lookback window for downloads">
+        <span class="label">Show chats from:</span>
+        <select id="chat-range" title="Date range for chat list">
+          <option value="this-week">This week</option>
+          <option value="last-7d" selected>Last 7 days</option>
+          <option value="last-30d">Last 30 days</option>
+          <option value="since-last-download">Since last download</option>
+          <option value="custom">Custom range\u2026</option>
+        </select>
+        <span id="chat-custom-range-inputs" class="custom-range" hidden>
+          <input type="date" id="chat-from" title="From (inclusive)" />
+          <span class="label">to</span>
+          <input type="date" id="chat-to" title="To (inclusive)" />
+        </span>
+        <button class="chip" id="marked-include" title="Always show marked chats regardless of range">\u2605 Always include marked</button>
+        <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
+        <span class="label">Download history per chat:</span>
+        <select id="lookback" title="Download history per chat">
           <option value="7">Last 7 days</option>
           <option value="30" selected>Last 30 days</option>
           <option value="90">Last 90 days</option>
@@ -775,16 +868,76 @@ function wireGlobalHandlers(account: AccountInfo): void {
     rerenderRecordingsList()
   })
 
-  // Chat lookback dropdown persists too; also re-run load with the new window
-  // if chats are already showing, so the user sees the updated range immediately.
-  el<HTMLSelectElement>("lookback").addEventListener("change", () => {
-    saveUIPrefs()
-    if (chatsState.chats.length > 0) {
+  // Chat range dropdown + custom date inputs — controls the list window; persisted
+  // to OneDrive userPrefs (cross-device), mirroring the recording range pattern.
+  el<HTMLSelectElement>("chat-range").addEventListener("change", () => {
+    const kind = el<HTMLSelectElement>("chat-range").value as ChatRange["kind"]
+    const chatCustomEl = el<HTMLSpanElement>("chat-custom-range-inputs")
+    chatCustomEl.hidden = kind !== "custom"
+    if (kind === "custom") {
+      const fromEl = el<HTMLInputElement>("chat-from")
+      const toEl = el<HTMLInputElement>("chat-to")
+      if (!fromEl.value) fromEl.value = toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
+      if (!toEl.value) toEl.value = toLocalDateString(new Date())
+      userPrefs = { ...userPrefs, chatRange: {
+        kind,
+        customFrom: fromEl.value || undefined,
+        customTo: toEl.value || undefined,
+      } }
+    } else {
+      userPrefs = { ...userPrefs, chatRange: { kind } }
+    }
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    // If chats are already loaded, clear and reload with the new range.
+    if (!el<HTMLButtonElement>("refreshchats").hidden) {
       clearCachedChats(userCacheKey())
       chatsState = { chats: [] }
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
+  })
+
+  const applyCustomChatRange = () => {
+    const fromEl = document.getElementById("chat-from") as HTMLInputElement | null
+    const toEl = document.getElementById("chat-to") as HTMLInputElement | null
+    userPrefs = { ...userPrefs, chatRange: {
+      kind: "custom",
+      customFrom: fromEl?.value || undefined,
+      customTo: toEl?.value || undefined,
+    } }
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    if (!el<HTMLButtonElement>("refreshchats").hidden) {
+      clearCachedChats(userCacheKey())
+      chatsState = { chats: [] }
+      el<HTMLUListElement>("chats").innerHTML = ""
+      void initialLoadChats()
+    }
+  }
+  el<HTMLInputElement>("chat-from").addEventListener("change", applyCustomChatRange)
+  el<HTMLInputElement>("chat-to").addEventListener("change", applyCustomChatRange)
+
+  // Marked-include toggle — persisted to OneDrive userPrefs; default ON.
+  el<HTMLButtonElement>("marked-include").addEventListener("click", () => {
+    const next = userPrefs.markedInclude === false ? true : false
+    userPrefs = { ...userPrefs, markedInclude: next }
+    el<HTMLButtonElement>("marked-include").classList.toggle("active", next)
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    // Reload so the marked-include enrichment runs (or stops running).
+    if (!el<HTMLButtonElement>("refreshchats").hidden) {
+      clearCachedChats(userCacheKey())
+      chatsState = { chats: [] }
+      el<HTMLUListElement>("chats").innerHTML = ""
+      void initialLoadChats()
+    }
+  })
+
+  // Chat lookback: persists the download-depth selection only. The list window
+  // is now owned by the chat-range selector above.
+  el<HTMLSelectElement>("lookback").addEventListener("change", () => {
+    saveUIPrefs()
   })
 
   // Meeting filters
@@ -931,7 +1084,9 @@ function switchSourceIfNeeded(wanted: SourceId): void {
 }
 
 /** Read module state and stash it in localStorage so reloads remember
- * the user's dropdown selections, chip filters, and source choice. */
+ * the user's dropdown selections, chip filters, and source choice.
+ * Note: lookback persists the message-download-depth selection; the list
+ * window range is owned by userPrefs.chatRange (synced to OneDrive). */
 function saveUIPrefs(): void {
   const lookbackEl = document.getElementById("lookback") as
     | HTMLSelectElement
@@ -994,10 +1149,10 @@ function syncUIControlsFromState(): void {
   // Source dropdown
   const sourceSel = document.getElementById("source-select") as HTMLSelectElement | null
   if (sourceSel) sourceSel.value = currentSource
-  // Chat lookback
+  // Chat lookback (download depth only — list range is synced via syncUserPrefsToUI)
   const lookbackEl = document.getElementById("lookback") as HTMLSelectElement | null
   if (lookbackEl && saved.lookback) lookbackEl.value = saved.lookback
-  // Recording range is synced via syncUserPrefsToUI (called from wireGlobalHandlers)
+  // Recording range + chat range are synced via syncUserPrefsToUI (called from wireGlobalHandlers)
   // Chat filter UI: search, sortby, type chips, markedonly
   const searchEl = document.getElementById("search") as HTMLInputElement | null
   if (searchEl) searchEl.value = filterState.search
@@ -1169,15 +1324,12 @@ async function initialLoadChats(): Promise<void> {
   loadBtn.disabled = true
   refreshBtn.disabled = true
 
-  // Determine recency window from the Lookback dropdown. Non-numeric values
-  // ("all", "since-last-download") are not valid day-counts for list windowing
-  // and fall back to 30 days — those options drive message-lookback, which is
-  // wired separately. The range selector for the list will be refined in a
-  // future task.
-  const lookbackVal = el<HTMLSelectElement>("lookback").value
-  const windowDays = parseInt(lookbackVal, 10)
-  const effectiveDays = isNaN(windowDays) ? 30 : windowDays
-  const cutoffMs = Date.now() - effectiveDays * 86400000
+  // Determine recency window from the dedicated chat-range selector (stored in
+  // userPrefs.chatRange, synced cross-device via OneDrive). The old
+  // lookback-as-window stopgap is gone; lookback now owns only download depth.
+  const range: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
+  const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
+  const rangeStr = chatRangeLabel(range, chatPrefs)
 
   // PROVEN METHOD — validated against a working reference implementation and a
   // live probe (80 chats for a 7-day window in ~5 pages, ZERO per-chat calls):
@@ -1191,8 +1343,10 @@ async function initialLoadChats(): Promise<void> {
   //     unstable between requests (87 ordering violations measured in the probe).
   //     Stopping on a SINGLE out-of-window page is fragile — one stale chat at
   //     a page boundary caused a prior run to stop at page 1 with only 13
-  //     results. We stop after 2 CONSECUTIVE fully-out-of-window pages so a
-  //     lone stale chat cannot cut the scan short. 30-page hard cap as backstop.
+  //     results. We stop after 2 CONSECUTIVE pages where ALL items are BELOW
+  //     cutoffMs. Items above untilMs (custom past-range upper bound) don't
+  //     trigger the stop — we may not have reached the window yet.
+  //     30-page hard cap as backstop.
   const kept: TeamsChatItem[] = []
   let cursor: string | null = null
   let consecutiveOutOfWindowPages = 0
@@ -1205,25 +1359,60 @@ async function initialLoadChats(): Promise<void> {
       cursor = page.nextCursor
       pageCount++
 
-      const inWindow = page.chats.filter(
-        (c) => new Date(c.lastUpdatedDateTime).getTime() >= cutoffMs,
+      const inWindow = page.chats.filter((c) => {
+        const t = new Date(c.lastUpdatedDateTime).getTime()
+        return t >= cutoffMs && t <= untilMs
+      })
+
+      // Only count a page as "out of window" if ALL items are BELOW the lower
+      // bound (cutoffMs). Items that are too recent (> untilMs, custom range)
+      // don't mean we've passed the window — we just haven't gotten there yet.
+      const allBelowCutoff = page.chats.every(
+        (c) => new Date(c.lastUpdatedDateTime).getTime() < cutoffMs,
       )
 
       if (inWindow.length > 0) {
         kept.push(...inWindow)
         consecutiveOutOfWindowPages = 0
-      } else {
+      } else if (allBelowCutoff) {
         consecutiveOutOfWindowPages++
+      } else {
+        // Items at/above cutoffMs exist but none in [cutoffMs, untilMs] —
+        // keep paging (we haven't reached the window's lower edge yet).
+        consecutiveOutOfWindowPages = 0
       }
 
       setStatus(`Loading recent chats… (${kept.length} in window so far)`)
 
-      // Jitter-tolerant stop: 2 consecutive fully-out-of-window pages means
-      // we've passed the window's edge (accounting for ordering instability).
+      // Jitter-tolerant stop: 2 consecutive fully-below-cutoff pages.
       if (consecutiveOutOfWindowPages >= 2) {
         cursor = null
       }
     } while (cursor !== null && pageCount < PAGE_HARD_CAP)
+
+    // Marked-include enrichment: fetch any marked chats that fell outside the
+    // window so they always appear, regardless of timestamp staleness.
+    const markedIncludeOn = userPrefs.markedInclude !== false // default ON
+    if (markedIncludeOn && markedIds.size > 0) {
+      const keptIds = new Set(kept.map((c) => c.id))
+      const missingMarked = [...markedIds].filter((id) => !keptIds.has(id))
+      if (missingMarked.length > 0) {
+        setStatus(`Fetching ${missingMarked.length} marked chat(s) outside window…`)
+        for (const id of missingMarked) {
+          try {
+            const chat = await fetchChatById(msal, id)
+            if (chat) kept.push(chat)
+          } catch (err) {
+            // Fail soft — a single marked chat failing should not abort the load.
+            console.warn(
+              "[m365-pull] Skipping marked chat (fetch failed):",
+              id,
+              (err as Error).message,
+            )
+          }
+        }
+      }
+    }
 
     kept.sort(
       (a, b) =>
@@ -1235,7 +1424,7 @@ async function initialLoadChats(): Promise<void> {
     rerenderChatList()
     saveCachedChats(userKey, kept)
     showChatsRefreshButton()
-    setStatus(`${kept.length} chats in the last ${effectiveDays} days.`)
+    setStatus(`${kept.length} chats (${rangeStr}).`)
   } catch (err) {
     // Partial recovery: save and show however many chats were kept before
     // the failure so progress isn't lost.

@@ -29,11 +29,23 @@ export interface RecordingRange {
   customTo?: string
 }
 
+export interface ChatRange {
+  kind: "this-week" | "last-7d" | "last-30d" | "since-last-download" | "custom"
+  /** yyyy-mm-dd; only meaningful when kind === "custom" */
+  customFrom?: string
+  /** yyyy-mm-dd; only meaningful when kind === "custom" */
+  customTo?: string
+}
+
 export interface UserPrefs {
   destination: Destination
   oneDriveFolder: string
   /** Last-used recording date range; synced across devices. Defaults to last-7d. */
   recordingRange?: RecordingRange
+  /** Last-used chat list date range; synced across devices. Defaults to last-7d. */
+  chatRange?: ChatRange
+  /** When true, always include marked chats in the list regardless of range. Defaults to true. */
+  markedInclude?: boolean
   /** When true, hide recordings that have already been downloaded. */
   hideDownloaded?: boolean
 }
