@@ -1,18 +1,36 @@
 import type { TeamsChatItem } from "../sources/teams-chats"
 
 // Bumped when the cache shape changes — old entries are ignored.
-// v2 adds `nextCursor` to support partial / progressive loading.
-const KEY_PREFIX = "m365-pull.chats.v2."
+// v3: removed nextCursor (always fully loaded now); slimmed members to
+//     displayName-only to stay well within the ~5MB localStorage quota.
+const KEY_PREFIX = "m365-pull.chats.v3."
 
 export interface ChatsCache {
   fetchedAt: string
   chats: TeamsChatItem[]
-  /** Opaque Graph cursor for the next page; null when fully loaded. */
-  nextCursor: string | null
 }
 
 function keyFor(userKey: string): string {
   return `${KEY_PREFIX}${userKey}`
+}
+
+/** Remove chat-cache blobs from older schema versions (v1/v2/…) that linger in
+ * localStorage and eat the ~5MB quota — the v2 blobs held FULL member objects
+ * and can be multiple MB, which is why a fresh v3 save can still hit quota.
+ * Targets ONLY this app's chat-cache keys; leaves prefs/marks/ui-state alone. */
+function pruneStaleChatCaches(): void {
+  try {
+    const stale: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i)
+      if (k && /^m365-pull\.chats\.v\d+\./.test(k) && !k.startsWith(KEY_PREFIX)) {
+        stale.push(k)
+      }
+    }
+    for (const k of stale) localStorage.removeItem(k)
+  } catch {
+    /* non-fatal */
+  }
 }
 
 export function loadCachedChats(userKey: string): ChatsCache | null {
@@ -24,23 +42,18 @@ export function loadCachedChats(userKey: string): ChatsCache | null {
     return {
       fetchedAt: parsed.fetchedAt,
       chats: parsed.chats,
-      nextCursor: parsed.nextCursor ?? null,
     }
   } catch {
     return null
   }
 }
 
-export function saveCachedChats(
-  userKey: string,
-  chats: TeamsChatItem[],
-  nextCursor: string | null,
-): void {
+export function saveCachedChats(userKey: string, chats: TeamsChatItem[]): void {
   try {
+    pruneStaleChatCaches() // free space held by orphaned old-version blobs
     const data: ChatsCache = {
       fetchedAt: new Date().toISOString(),
       chats,
-      nextCursor,
     }
     localStorage.setItem(keyFor(userKey), JSON.stringify(data))
   } catch (err) {

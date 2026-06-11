@@ -45,23 +45,70 @@ async function getToken(
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** Graph API GET with bounded retry for transient errors.
+ *
+ * Retries on 429 (throttle), 502, 503, 504 (gateway/transient) up to 5
+ * attempts. Honors the `Retry-After` response header (seconds, clamped to
+ * MAX_RETRY_AFTER_S). Falls back to exponential backoff with jitter when the
+ * header is absent. All other non-OK statuses throw immediately.
+ */
 async function graphGet<T>(
   msal: PublicClientApplication,
   path: string,
   scopes: string[],
 ): Promise<T> {
-  const token = await getToken(msal, scopes)
-  const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!response.ok) {
-    const body = await response.text()
-    throw new Error(
-      `Graph ${path}: ${response.status} ${response.statusText} — ${body.slice(0, 500)}`,
-    )
+  const RETRY_STATUSES = new Set([429, 502, 503, 504])
+  const MAX_ATTEMPTS = 5
+  const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000]
+  const MAX_RETRY_AFTER_S = 60
+
+  let lastStatus = 0
+  let lastText = ""
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const token = await getToken(msal, scopes)
+    const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+
+    if (response.ok) {
+      return response.json() as Promise<T>
+    }
+
+    lastStatus = response.status
+    lastText = await response.text()
+
+    if (!RETRY_STATUSES.has(response.status)) {
+      // Non-retryable (400, 401, 403, 404, …) — fail immediately.
+      throw new Error(
+        `Graph ${path}: ${response.status} ${response.statusText} — ${lastText.slice(0, 500)}`,
+      )
+    }
+
+    if (attempt === MAX_ATTEMPTS - 1) break // exhausted, throw below
+
+    // Compute wait: honor Retry-After header if present, else exponential backoff.
+    let waitMs: number
+    const retryAfterHeader = response.headers.get("Retry-After")
+    if (retryAfterHeader) {
+      const parsed = parseInt(retryAfterHeader, 10)
+      waitMs = (isNaN(parsed) ? 1 : Math.min(parsed, MAX_RETRY_AFTER_S)) * 1000
+    } else {
+      waitMs = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]
+    }
+    waitMs += Math.random() * 250 // jitter 0–250 ms
+
+    await sleep(waitMs)
   }
-  return response.json() as Promise<T>
+
+  throw new Error(
+    `Graph ${path}: ${lastStatus} after ${MAX_ATTEMPTS} attempts — ${lastText.slice(0, 500)}`,
+  )
 }
 
 export interface ListChatsPageResult {
@@ -87,7 +134,13 @@ export async function listChatsPage(
   const path = cursor ?? "/me/chats?$top=50&$expand=members"
   const page = await graphGet<ChatsApiPage>(msal, path, ["Chat.Read"])
   return {
-    chats: page.value,
+    // Slim members to displayName-only at the parse boundary. chatDisplayName()
+    // only reads displayName; userId is not consumed in the chats flow.
+    // Keeps both the in-memory model and the localStorage cache small.
+    chats: page.value.map((chat) => ({
+      ...chat,
+      members: chat.members?.map((m) => ({ displayName: m.displayName })),
+    })),
     nextCursor: page["@odata.nextLink"] ?? null,
   }
 }
@@ -198,53 +251,6 @@ export function buildChatArchiveFilename(
     return `${date}-${time}-${slug}-${shortId}${ext}`
   }
   return `${slug}-${shortId}${ext}`
-}
-
-/** Enrich each chat's `lastUpdatedDateTime` with the actual latest message
- * timestamp from `/me/chats/{id}/messages`. Graph's chat-level field is
- * known-stale: it doesn't bump for every new message (especially in 1:1s),
- * so the list can show months-old dates for chats that were active yesterday.
- *
- * One $top=1 message fetch per chat. Run with a concurrency cap so we don't
- * fire 50 requests at once. Failures (closed/archived chats) leave the
- * original value in place rather than blocking the whole load.
- */
-export async function enrichChatsWithLatestActivity(
-  msal: PublicClientApplication,
-  chats: TeamsChatItem[],
-  options: { concurrency?: number; onProgress?: (note: string) => void } = {},
-): Promise<TeamsChatItem[]> {
-  const concurrency = Math.max(1, options.concurrency ?? 5)
-  const out: TeamsChatItem[] = chats.map((c) => c)
-  let cursor = 0
-  let done = 0
-
-  async function worker(): Promise<void> {
-    while (true) {
-      const idx = cursor++
-      if (idx >= chats.length) return
-      const chat = chats[idx]
-      try {
-        const path = `/me/chats/${encodeURIComponent(chat.id)}/messages?$top=1&$select=createdDateTime`
-        const resp = await graphGet<{ value: { createdDateTime?: string }[] }>(
-          msal,
-          path,
-          ["Chat.Read"],
-        )
-        const latest = resp.value?.[0]?.createdDateTime
-        if (latest && latest > chat.lastUpdatedDateTime) {
-          out[idx] = { ...chat, lastUpdatedDateTime: latest }
-        }
-      } catch {
-        // Leave the chat as-is on lookup failure.
-      }
-      done++
-      options.onProgress?.(`Verifying activity (${done}/${chats.length})\u2026`)
-    }
-  }
-
-  await Promise.all(Array.from({ length: concurrency }, () => worker()))
-  return out
 }
 
 export function chatDisplayName(chat: TeamsChatItem): string {

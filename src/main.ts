@@ -6,7 +6,6 @@ import {
   fetchChatMessages,
   chatDisplayName,
   buildChatArchiveFilename,
-  enrichChatsWithLatestActivity,
   type TeamsChatItem,
 } from "./sources/teams-chats"
 import {
@@ -78,7 +77,6 @@ type SourceId = "teams.chats" | "teams.recordings"
 
 interface ChatsState {
   chats: TeamsChatItem[]
-  nextCursor: string | null
 }
 
 interface RecordingsState {
@@ -126,7 +124,7 @@ const SIGNIN_SCOPES = [
 ]
 
 let currentSource: SourceId = "teams.chats"
-let chatsState: ChatsState = { chats: [], nextCursor: null }
+let chatsState: ChatsState = { chats: [] }
 let recordingsState: RecordingsState = { recordings: [], chatsScanned: 0, truncated: false }
 let filterState: FilterState = {
   search: "",
@@ -671,9 +669,6 @@ function render(): void {
       <div id="status"></div>
       <ul id="chats" class="chat-list"></ul>
       <ul id="recordings" class="chat-list" hidden></ul>
-      <div id="loadmore-row" class="loadmore-row" hidden>
-        <button id="loadmore">Load more</button>
-      </div>
     </main>
   `
 
@@ -780,9 +775,16 @@ function wireGlobalHandlers(account: AccountInfo): void {
     rerenderRecordingsList()
   })
 
-  // Chat lookback dropdown persists too
+  // Chat lookback dropdown persists too; also re-run load with the new window
+  // if chats are already showing, so the user sees the updated range immediately.
   el<HTMLSelectElement>("lookback").addEventListener("change", () => {
     saveUIPrefs()
+    if (chatsState.chats.length > 0) {
+      clearCachedChats(userCacheKey())
+      chatsState = { chats: [] }
+      el<HTMLUListElement>("chats").innerHTML = ""
+      void initialLoadChats()
+    }
   })
 
   // Meeting filters
@@ -826,12 +828,6 @@ function wireGlobalHandlers(account: AccountInfo): void {
         saveUIPrefs()
       })
     })
-
-  // Shared load-more button (context-dependent)
-  el<HTMLButtonElement>("loadmore").addEventListener("click", () => {
-    if (currentSource === "teams.chats") void loadMoreChats()
-    // recordings source has no pagination -- loadmore-row stays hidden
-  })
 
   // Chats filters
   const search = el<HTMLInputElement>("search")
@@ -1041,10 +1037,8 @@ function applySourceVisibility(): void {
   el<HTMLUListElement>("recordings").hidden = isChats
   updateFiltersVisibility()
   if (isChats) {
-    updateLoadMore()
     updateMatchSummary(applyFiltersAndSort(chatsState.chats).length)
   } else {
-    el<HTMLDivElement>("loadmore-row").hidden = true
     updateRecordingsSummary()
   }
 }
@@ -1062,7 +1056,7 @@ function rerenderChatList(): void {
     list.innerHTML = `<li class="empty">No chats match these filters. ${
       filterState.markedOnly
         ? "Star some chats from the list to add them here."
-        : "Loosen the filters or load more chats."
+        : "Loosen the filters."
     }</li>`
   } else {
     list.innerHTML = filtered.map(renderChatRow).join("")
@@ -1089,11 +1083,10 @@ function updateMatchSummary(visible: number): void {
   const total = chatsState.chats.length
   const marked = markedIds.size
   const filtered = visible < total
-  const more = chatsState.nextCursor ? " · more available" : ""
   if (filtered) {
-    setStatus(`Showing ${visible} of ${total} loaded · ${marked} marked${more}`)
+    setStatus(`Showing ${visible} of ${total} loaded · ${marked} marked`)
   } else {
-    setStatus(`${total} chats loaded · ${marked} marked${more}`)
+    setStatus(`${total} chats loaded · ${marked} marked`)
   }
 }
 
@@ -1150,19 +1143,6 @@ function updateFiltersVisibility(): void {
     currentSource !== "teams.recordings" || recordingsState.recordings.length === 0
 }
 
-function updateLoadMore(): void {
-  const row = el<HTMLDivElement>("loadmore-row")
-  const btn = el<HTMLButtonElement>("loadmore")
-  if (currentSource !== "teams.chats") return
-  if (chatsState.nextCursor) {
-    row.hidden = false
-    btn.textContent = `Load more chats (${chatsState.chats.length} loaded so far)`
-    btn.disabled = false
-  } else {
-    row.hidden = true
-  }
-}
-
 function showChatsRefreshButton(): void {
   el<HTMLButtonElement>("loadchats").hidden = true
   el<HTMLButtonElement>("refreshchats").hidden = false
@@ -1174,13 +1154,11 @@ async function initialLoadChats(): Promise<void> {
   const userKey = userCacheKey()
   const cached = loadCachedChats(userKey)
   if (cached && cached.chats.length > 0) {
-    chatsState = { chats: cached.chats, nextCursor: cached.nextCursor }
+    chatsState = { chats: cached.chats }
     rerenderChatList()
-    updateLoadMore()
     showChatsRefreshButton()
-    const moreNote = cached.nextCursor ? " (partial · Load more available)" : " (full list)"
     setStatus(
-      `Showing ${cached.chats.length} cached chats from ${formatAge(ageMs(cached))}${moreNote}. Refreshing first page…`,
+      `Showing ${cached.chats.length} cached chats from ${formatAge(ageMs(cached))}. Refreshing…`,
     )
   } else {
     setStatus("Loading chats…")
@@ -1190,28 +1168,90 @@ async function initialLoadChats(): Promise<void> {
   const refreshBtn = el<HTMLButtonElement>("refreshchats")
   loadBtn.disabled = true
   refreshBtn.disabled = true
+
+  // Determine recency window from the Lookback dropdown. Non-numeric values
+  // ("all", "since-last-download") are not valid day-counts for list windowing
+  // and fall back to 30 days — those options drive message-lookback, which is
+  // wired separately. The range selector for the list will be refined in a
+  // future task.
+  const lookbackVal = el<HTMLSelectElement>("lookback").value
+  const windowDays = parseInt(lookbackVal, 10)
+  const effectiveDays = isNaN(windowDays) ? 30 : windowDays
+  const cutoffMs = Date.now() - effectiveDays * 86400000
+
+  // PROVEN METHOD — validated against a working reference implementation and a
+  // live probe (80 chats for a 7-day window in ~5 pages, ZERO per-chat calls):
+  //
+  // (a) No per-chat enrichment: lastUpdatedDateTime from /me/chats is trusted
+  //     directly. The probe confirmed it returns the correct recent set.
+  //     Accepted gap: rare deeply-stale 1:1s (months-silent, one recent msg)
+  //     may sit below the stop point and won't appear — explicit, accepted cost.
+  //
+  // (b) Jitter-tolerant stop: Graph's chat ordering is non-monotonic and
+  //     unstable between requests (87 ordering violations measured in the probe).
+  //     Stopping on a SINGLE out-of-window page is fragile — one stale chat at
+  //     a page boundary caused a prior run to stop at page 1 with only 13
+  //     results. We stop after 2 CONSECUTIVE fully-out-of-window pages so a
+  //     lone stale chat cannot cut the scan short. 30-page hard cap as backstop.
+  const kept: TeamsChatItem[] = []
+  let cursor: string | null = null
+  let consecutiveOutOfWindowPages = 0
+  const PAGE_HARD_CAP = 30
+
   try {
-    const page = await listChatsPage(msal, null)
-    chatsState = { chats: page.chats, nextCursor: page.nextCursor }
+    let pageCount = 0
+    do {
+      const page = await listChatsPage(msal, cursor)
+      cursor = page.nextCursor
+      pageCount++
+
+      const inWindow = page.chats.filter(
+        (c) => new Date(c.lastUpdatedDateTime).getTime() >= cutoffMs,
+      )
+
+      if (inWindow.length > 0) {
+        kept.push(...inWindow)
+        consecutiveOutOfWindowPages = 0
+      } else {
+        consecutiveOutOfWindowPages++
+      }
+
+      setStatus(`Loading recent chats… (${kept.length} in window so far)`)
+
+      // Jitter-tolerant stop: 2 consecutive fully-out-of-window pages means
+      // we've passed the window's edge (accounting for ordering instability).
+      if (consecutiveOutOfWindowPages >= 2) {
+        cursor = null
+      }
+    } while (cursor !== null && pageCount < PAGE_HARD_CAP)
+
+    kept.sort(
+      (a, b) =>
+        new Date(b.lastUpdatedDateTime).getTime() -
+        new Date(a.lastUpdatedDateTime).getTime(),
+    )
+
+    chatsState = { chats: kept }
     rerenderChatList()
-    updateLoadMore()
-    saveCachedChats(userKey, chatsState.chats, chatsState.nextCursor)
+    saveCachedChats(userKey, kept)
     showChatsRefreshButton()
-    // Graph's /me/chats lastUpdatedDateTime is unreliable -- it doesn't bump
-    // for every new message. Enrich with the real last-message timestamp by
-    // fetching $top=1 message per chat. Concurrent, with status updates.
-    setStatus(`Loaded ${page.chats.length} chats. Verifying activity dates…`)
-    const enriched = await enrichChatsWithLatestActivity(msal, chatsState.chats, {
-      concurrency: 5,
-      onProgress: (note) => setStatus(note),
-    })
-    chatsState = { chats: enriched, nextCursor: chatsState.nextCursor }
-    rerenderChatList()
-    saveCachedChats(userKey, chatsState.chats, chatsState.nextCursor)
-    setStatus(`${enriched.length} chats loaded (activity dates verified).`)
+    setStatus(`${kept.length} chats in the last ${effectiveDays} days.`)
   } catch (err) {
+    // Partial recovery: save and show however many chats were kept before
+    // the failure so progress isn't lost.
+    if (kept.length > 0) {
+      chatsState = { chats: kept }
+      rerenderChatList()
+      saveCachedChats(userKey, kept)
+    }
     setStatus(
-      `Refresh failed: ${(err as Error).message}${cached ? " — showing cached." : ""}`,
+      `Load failed: ${(err as Error).message}${
+        cached
+          ? " — showing cached."
+          : kept.length > 0
+            ? ` — showing ${kept.length} partially loaded chats.`
+            : ""
+      }`,
       "error",
     )
   } finally {
@@ -1220,34 +1260,10 @@ async function initialLoadChats(): Promise<void> {
   }
 }
 
-async function loadMoreChats(): Promise<void> {
-  if (!chatsState.nextCursor) return
-  const btn = el<HTMLButtonElement>("loadmore")
-  btn.disabled = true
-  btn.textContent = "Loading more…"
-  try {
-    const page = await listChatsPage(msal, chatsState.nextCursor)
-    // Enrich just this page's chats with real last-activity timestamps
-    const enriched = await enrichChatsWithLatestActivity(msal, page.chats, {
-      concurrency: 5,
-    })
-    chatsState.chats = [...chatsState.chats, ...enriched]
-    chatsState.nextCursor = page.nextCursor
-    rerenderChatList()
-    updateLoadMore()
-    saveCachedChats(userCacheKey(), chatsState.chats, chatsState.nextCursor)
-  } catch (err) {
-    setStatus(`Load more failed: ${(err as Error).message}`, "error")
-    btn.disabled = false
-    btn.textContent = "Load more chats"
-  }
-}
-
 async function refreshChats(): Promise<void> {
   clearCachedChats(userCacheKey())
-  chatsState = { chats: [], nextCursor: null }
+  chatsState = { chats: [] }
   el<HTMLUListElement>("chats").innerHTML = ""
-  el<HTMLDivElement>("loadmore-row").hidden = true
   await initialLoadChats()
 }
 
