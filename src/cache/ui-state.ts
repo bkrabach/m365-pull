@@ -7,7 +7,7 @@ type SortKey = "marked-first" | "recent" | "name"
 
 export interface UIState {
   currentSource?: string
-  /** Chats source: lookback dropdown value */
+  /** Chats source: lookback dropdown value (controls message-download depth, not list range) */
   lookback?: string
   chatFilter?: {
     search: string
