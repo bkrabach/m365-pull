@@ -443,8 +443,7 @@ header {
 /* Hidden attribute fix -- .actions { display: flex } was overriding the
  * UA default of display:none for [hidden] elements. Make hidden actually hide. */
 .actions[hidden],
-.filters[hidden],
-.loadmore-row[hidden] {
+.filters[hidden] {
   display: none;
 }
 
@@ -479,17 +478,6 @@ header {
   border: 1px dashed var(--border);
   color: var(--muted);
   font-style: italic;
-}
-
-/* Load more row */
-.loadmore-row {
-  display: flex;
-  justify-content: center;
-  margin-top: 0.75rem;
-}
-
-.loadmore-row button {
-  min-width: 280px;
 }
 
 /* Filter row */
