@@ -177,6 +177,17 @@ header {
   flex-wrap: wrap;
 }
 
+/* Item 3: sticky actions bar so Include toggles stay reachable while scrolling */
+#actions {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  padding-top: 0.4rem;
+  padding-bottom: 0.4rem;
+  margin-bottom: 0;
+}
+
 .actions .label {
   font-size: 0.85rem;
   color: var(--muted);
@@ -427,6 +438,46 @@ header {
   flex-shrink: 0;
 }
 
+/* Recordings indicator in container rows (🎙 N) */
+.rec-indicator {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  padding: 0.15rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  user-select: none;
+}
+
+.rec-indicator.rec-pending {
+  opacity: 0.45;
+  border-style: dashed;
+}
+
+/* Scan confirmed no recordings — muted solid badge */
+.rec-indicator.rec-none {
+  opacity: 0.5;
+  font-style: italic;
+}
+
+/* Scan finished but no entry — couldn't determine */
+.rec-indicator.rec-unknown {
+  opacity: 0.4;
+  border-style: dashed;
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+/* Quiet persistent scan-progress indicator (separate from transient #status) */
+.scan-status {
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-height: 1.2em;
+  padding: 0 0 0.25rem;
+}
+
 .empty {
   padding: 2rem 1rem;
   text-align: center;
@@ -589,11 +640,11 @@ header {
   background: white;
 }
 
-/* Star/mark toggle on each chat row */
+/* Star/mark toggle on each chat row — 44px min hit target (Item 6) */
 .mark-toggle {
   flex-shrink: 0;
-  width: 32px;
-  height: 32px;
+  width: 44px;
+  height: 44px;
   padding: 0;
   border: none;
   background: transparent;
@@ -618,11 +669,11 @@ header {
   background: linear-gradient(to right, rgba(245, 158, 11, 0.06), transparent 80%);
 }
 
-/* Ignore toggle on each chat row — mirrors .mark-toggle */
+/* Ignore toggle on each chat row — mirrors .mark-toggle; 44px min hit target (Item 6) */
 .ignore-toggle {
   flex-shrink: 0;
-  width: 32px;
-  height: 32px;
+  width: 44px;
+  height: 44px;
   padding: 0;
   border: none;
   background: transparent;

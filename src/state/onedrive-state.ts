@@ -50,6 +50,10 @@ export interface UserPrefs {
   hideDownloaded?: boolean
   /** When true, always include marked recording containers in the list regardless of range. Defaults to true. */
   recordingMarkedInclude?: boolean
+  /** When true (default), sync message archives when downloading a container. */
+  includeMessages?: boolean
+  /** When true (default), sync transcripts when downloading a container. */
+  includeRecordings?: boolean
 }
 
 export interface AppState {

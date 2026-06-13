@@ -12,7 +12,6 @@ import {
 import {
   listRecordings,
   buildTranscriptFilename,
-  type ChatType,
   type RecordingItem,
   type RecordingContainer,
 } from "./sources/teams-call-recordings"
@@ -51,14 +50,13 @@ import {
   type AppState,
   type ChatPrefs,
   type RecordingPrefs,
-  type RecordingRange,
 } from "./state/onedrive-state"
 
 const app = document.getElementById("app") as HTMLDivElement
 
 if (!config.clientId || !config.tenantId) {
   app.innerHTML =
-    '<p class="empty">Missing MSAL config — set <code>clientId</code> and <code>tenantId</code> in <code>src/config.ts</code>. See README.md.</p>'
+    '<p class="empty">Missing MSAL config \u2014 set <code>clientId</code> and <code>tenantId</code> in <code>src/config.ts</code>. See README.md.</p>'
   throw new Error("Missing MSAL config")
 }
 
@@ -79,7 +77,7 @@ if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
 // In production the Static Web App enforces an EasyAuth access-gate: anonymous
 // users are redirected to Entra and authenticated BEFORE this bundle ever loads
 // (see staticwebapp.config.json). EasyAuth's session is a server-side SWA cookie
-// — it does NOT populate MSAL's cache — so without this bridge the user would be
+// \u2014 it does NOT populate MSAL's cache \u2014 so without this bridge the user would be
 // prompted to sign in a SECOND time by MSAL.js. ssoSilent rides the shared Entra
 // session cookie established by the EasyAuth login to silently establish an MSAL
 // account, collapsing the two logins into a single visible ceremony.
@@ -89,7 +87,7 @@ if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
 if (!msal.getActiveAccount()) {
   const cached = msal.getAllAccounts()
   if (cached.length > 0) {
-    // Returning visit — reuse the account MSAL already cached.
+    // Returning visit \u2014 reuse the account MSAL already cached.
     msal.setActiveAccount(cached[0])
   } else {
     try {
@@ -102,7 +100,7 @@ if (!msal.getActiveAccount()) {
           loginHint = data?.clientPrincipal?.userDetails || undefined
         }
       } catch {
-        // /.auth/me unavailable (local dev) — attempt ssoSilent without a hint.
+        // /.auth/me unavailable (local dev) \u2014 attempt ssoSilent without a hint.
       }
       // Minimal scope just to establish the account/session; per-call tokens for
       // Chat.Read / Files.* are acquired later via acquireTokenSilent (already
@@ -110,14 +108,12 @@ if (!msal.getActiveAccount()) {
       const sso = await msal.ssoSilent(loginHint ? { scopes: ["User.Read"], loginHint } : { scopes: ["User.Read"] })
       if (sso?.account) msal.setActiveAccount(sso.account)
     } catch {
-      // No silent session bridge available — render() shows the sign-in button.
+      // No silent session bridge available \u2014 render() shows the sign-in button.
     }
   }
 }
 
 // ----- State -----
-
-type SourceId = "teams.chats" | "teams.recordings"
 
 interface ChatsState {
   chats: TeamsChatItem[]
@@ -139,22 +135,9 @@ interface FilterState {
   showIgnored: boolean
 }
 
-interface RecordingFilterState {
-  search: string
-  sortKey: SortKey
-  markedOnly: boolean
-  enabledKinds: Set<ChatType>
-}
-
 type SyncStatus = "idle" | "syncing" | "synced" | "error" | "offline"
 
 const KNOWN_TYPES: { id: string; label: string }[] = [
-  { id: "oneOnOne", label: "1:1" },
-  { id: "group", label: "Group" },
-  { id: "meeting", label: "Meeting" },
-]
-
-const CHAT_TYPE_KINDS: { id: ChatType; label: string }[] = [
   { id: "oneOnOne", label: "1:1" },
   { id: "group", label: "Group" },
   { id: "meeting", label: "Meeting" },
@@ -168,21 +151,22 @@ const SIGNIN_SCOPES = [
   "Files.ReadWrite.AppFolder",
 ]
 
-let currentSource: SourceId = "teams.chats"
 let chatsState: ChatsState = { chats: [] }
 let recordingsState: RecordingsState = { containers: [], chatsScanned: 0, truncated: false }
+/** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
+let recordingsMap: Map<string, RecordingContainer> = new Map()
+/** True while the background recordings scan is running; rows show pending indicator. */
+let recordingsPending = false
+/** True after the background recordings scan has completed (success or error); distinguishes
+ * "no entry yet — still checking" from "no entry — scan done, couldn't determine". */
+let recordingsScanFinished = false
+
 let filterState: FilterState = {
   search: "",
   enabledTypes: new Set(KNOWN_TYPES.map((t) => t.id)),
   sortKey: "marked-first",
   markedOnly: false,
   showIgnored: false,
-}
-let recordingFilterState: RecordingFilterState = {
-  search: "",
-  sortKey: "marked-first",
-  markedOnly: false,
-  enabledKinds: new Set(CHAT_TYPE_KINDS.map((k) => k.id)),
 }
 let markedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
@@ -231,51 +215,27 @@ function formatDateShort(d: Date): string {
  * Graph stamps the same `lastMessagePreview` slot for both kinds of system
  * event, but only the call/meeting ones reflect real activity. The eventDetail
  * `@odata.type` (e.g. `#microsoft.graph.callRecordingEventMessageDetail`)
- * carries the discriminator — we match the substring "call" case-insensitively.
+ * carries the discriminator \u2014 we match the substring "call" case-insensitively.
  *
  * Defensive: returns false when `eventDetail`/`@odata.type` is absent, so a
  * chat with no usable discriminator degrades to the createdDateTime sentinel
- * (current behaviour — never crashes, never falsely counts roster churn). */
+ * (current behaviour \u2014 never crashes, never falsely counts roster churn). */
 function isCallActivityEvent(preview: TeamsChatItem["lastMessagePreview"]): boolean {
   const odataType = preview?.eventDetail?.["@odata.type"]
   return typeof odataType === "string" && odataType.toLowerCase().includes("call")
 }
 
-/** Derive the "last real conversation activity" timestamp (ms) for a chat.
- *
- * Graph bumps `lastUpdatedDateTime` on ANY chat entity change — membership
- * roster updates, org departures (`membersDeletedEventMessageDetail`),
- * renames — not just real messages. A chat dead for years can surface as
- * "active today" due to a roster system event. 33 of 40 sampled recent chats
- * were phantoms with this pattern (probe result 2026-06-11).
- *
- * BUT not all system events are noise: an active MEETING chat's newest item is
- * often a `callRecordingEventMessageDetail` (a systemEventMessage from the most
- * recent meeting) — that IS real activity. Treating all system events as noise
- * wrongly dated active meeting chats to their CREATION date (e.g. "Amplifier
- * team chat" showed 1/26/2026 despite meeting yesterday).
- *
- * Rule: use `lastMessagePreview.createdDateTime` when the preview is EITHER a
- * real human message (`messageType === "message"`) OR a call/meeting system
- * event (see isCallActivityEvent). Otherwise — roster/membership churn or no
- * usable preview — fall back to `createdDateTime` as a distant sentinel so the
- * chat sorts below genuinely-active chats and falls outside recent windows.
- *
- * Defensive: if `lastMessagePreview` is absent (older cache, unexpected API
- * response) the behaviour degrades to the sentinel — never crashes.
- */
+/** Derive the "last real conversation activity" timestamp (ms) for a chat. */
 function chatActivityDate(chat: TeamsChatItem): number {
   const preview = chat.lastMessagePreview
   const isRealMessage = preview?.messageType === "message"
   if ((isRealMessage || isCallActivityEvent(preview)) && preview?.createdDateTime) {
     return new Date(preview.createdDateTime).getTime()
   }
-  // Roster churn / no usable preview: fall back to createdDateTime as the
-  // oldest reasonable timestamp for this chat so it doesn't pollute recent windows.
   return new Date(chat.createdDateTime).getTime()
 }
 
-// ----- Recording range helpers -----
+// ----- Range helpers -----
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -288,7 +248,7 @@ function toLocalDateString(d: Date): string {
 /** Midnight (00:00:00.000) of the most recent Monday in local time. */
 function startOfThisWeekMonday(): number {
   const now = new Date()
-  const dayOfWeek = now.getDay() // 0=Sun, 1=Mon, … 6=Sat
+  const dayOfWeek = now.getDay() // 0=Sun, 1=Mon, \u2026 6=Sat
   const daysSinceMonday = (dayOfWeek + 6) % 7
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysSinceMonday).getTime()
 }
@@ -305,48 +265,6 @@ function endOfLocalDay(yyyyMmDd: string): number {
   return new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
 }
 
-/** Map a persisted RecordingRange to a concrete [fromMs, toMs] window.
- * For since-last-download with no prior sync, falls back to last-7d. */
-function computeRecordingWindow(range: RecordingRange): { fromMs: number; toMs: number } {
-  const now = Date.now()
-  switch (range.kind) {
-    case "this-week":
-      return { fromMs: startOfThisWeekMonday(), toMs: now }
-    case "last-7d":
-      return { fromMs: now - 7 * DAY_MS, toMs: now }
-    case "last-30d":
-      return { fromMs: now - 30 * DAY_MS, toMs: now }
-    case "since-last-download": {
-      const t = mostRecentRecordingSync()
-      return { fromMs: t !== null ? t : now - 7 * DAY_MS, toMs: now }
-    }
-    case "custom": {
-      const fromMs = range.customFrom ? startOfLocalDay(range.customFrom) : now - 7 * DAY_MS
-      const toMs = range.customTo ? endOfLocalDay(range.customTo) : now
-      return { fromMs, toMs }
-    }
-  }
-}
-
-/** Human-readable label for a RecordingRange (used in status messages). */
-function rangeLabel(range: RecordingRange): string {
-  switch (range.kind) {
-    case "this-week": return "this week"
-    case "last-7d": return "last 7 days"
-    case "last-30d": return "last 30 days"
-    case "since-last-download": {
-      const t = mostRecentRecordingSync()
-      if (t === null) return "since last download (none yet \u2014 showing 7 days)"
-      return `since last download (${formatDateShort(new Date(t))})`
-    }
-    case "custom":
-      if (range.customFrom && range.customTo) return `${range.customFrom} to ${range.customTo}`
-      if (range.customFrom) return `from ${range.customFrom}`
-      return "custom range"
-  }
-}
-
-// ----- Chat range helpers -----
 
 /** Most recent chatPrefs.lastSync timestamp across all synced chats, or null. */
 function mostRecentChatSync(prefs: Record<string, { lastSync?: string }>): number | null {
@@ -360,17 +278,6 @@ function mostRecentChatSync(prefs: Record<string, { lastSync?: string }>): numbe
   return most
 }
 
-/** Most recent recordingPrefs.lastSync timestamp across all synced recordings, or null. */
-function mostRecentRecordingSync(): number | null {
-  let most: number | null = null
-  for (const v of Object.values(recordingPrefs)) {
-    if (v.lastSync) {
-      const t = Date.parse(v.lastSync)
-      if (!isNaN(t) && (most === null || t > most)) most = t
-    }
-  }
-  return most
-}
 
 /** Map a persisted ChatRange to a concrete [cutoffMs, untilMs] window.
  *  For since-last-download with no prior sync, falls back to last-7d. */
@@ -422,6 +329,12 @@ function setStatus(text: string, kind: "info" | "error" = "info"): void {
   status.className = kind === "error" ? "error" : ""
 }
 
+/** Update the quiet persistent scan-progress indicator (separate from the transient status line). */
+function setScanStatus(text: string): void {
+  const scanEl = document.getElementById("scan-status")
+  if (scanEl) scanEl.textContent = text
+}
+
 function userCacheKey(): string {
   const account = msal.getActiveAccount()
   if (!account) return "anon"
@@ -441,23 +354,8 @@ function syncUserPrefsToUI(): void {
     | null
   if (folderEl) folderEl.hidden = userPrefs.destination !== "onedrive"
   if (editBtn) editBtn.textContent = userPrefs.oneDriveFolder
-  // Populate the "↗ Open" link to the destination folder in OneDrive on the web.
-  // Fire-and-forget: it resolves the folder's Graph driveItem webUrl and shows
-  // the link only when the folder exists. Hidden until then.
+  // Populate the "\u2197 Open" link to the destination folder in OneDrive on the web.
   void refreshOneDriveFolderLink()
-
-  // Recording range
-  const range: RecordingRange = userPrefs.recordingRange ?? { kind: "last-7d" }
-  const rangeEl = document.getElementById("recording-range") as HTMLSelectElement | null
-  if (rangeEl) rangeEl.value = range.kind
-  const customEl = document.getElementById("custom-range-inputs") as HTMLSpanElement | null
-  if (customEl) customEl.hidden = range.kind !== "custom"
-  if (range.kind === "custom") {
-    const fromEl = document.getElementById("recording-from") as HTMLInputElement | null
-    const toEl = document.getElementById("recording-to") as HTMLInputElement | null
-    if (fromEl && range.customFrom) fromEl.value = range.customFrom
-    if (toEl && range.customTo) toEl.value = range.customTo
-  }
 
   // Chat range
   const chatRange: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
@@ -472,27 +370,27 @@ function syncUserPrefsToUI(): void {
     if (chatToEl && chatRange.customTo) chatToEl.value = chatRange.customTo
   }
 
-  // Chat marked-include toggle (default ON: undefined → true)
+  // Chat marked-include toggle (default ON: undefined \u2192 true)
   const markedIncludeBtn = document.getElementById("marked-include") as HTMLButtonElement | null
   if (markedIncludeBtn)
     markedIncludeBtn.classList.toggle("active", userPrefs.markedInclude !== false)
 
-  // Recording marked-include toggle (default ON: undefined → true)
-  const recMarkedIncludeBtn = document.getElementById("rec-marked-include") as HTMLButtonElement | null
-  if (recMarkedIncludeBtn)
-    recMarkedIncludeBtn.classList.toggle("active", userPrefs.recordingMarkedInclude !== false)
+  // Include-messages toggle (default ON)
+  const includeMessagesBtn = document.getElementById("include-messages") as HTMLButtonElement | null
+  if (includeMessagesBtn)
+    includeMessagesBtn.classList.toggle("active", userPrefs.includeMessages !== false)
+
+  // Include-recordings toggle (default ON)
+  const includeRecordingsBtn = document.getElementById("include-recordings") as HTMLButtonElement | null
+  if (includeRecordingsBtn)
+    includeRecordingsBtn.classList.toggle("active", userPrefs.includeRecordings !== false)
 
   // Hide-downloaded toggle
   const hideBtn = document.getElementById("hide-downloaded") as HTMLButtonElement | null
   if (hideBtn) hideBtn.classList.toggle("active", !!userPrefs.hideDownloaded)
 }
 
-/** Populate the "↗ Open" link next to the OneDrive folder path. Resolves the
- * destination folder's Graph driveItem webUrl and shows the link only when the
- * folder exists (it's auto-created on first download). Hidden otherwise — when
- * destination isn't OneDrive, the folder hasn't been created yet, or the URL is
- * unavailable. Shared across the chats and recordings surfaces (single top-bar
- * folder display). Passive: never triggers a consent redirect. */
+/** Populate the "\u2197 Open" link next to the OneDrive folder path. */
 async function refreshOneDriveFolderLink(): Promise<void> {
   const link = document.getElementById("open-folder") as HTMLAnchorElement | null
   if (!link) return
@@ -540,7 +438,7 @@ function updateSyncIndicator(): void {
       title = "Sign in to sync marks across devices"
       break
     case "syncing":
-      text = "syncing…"
+      text = "syncing\u2026"
       cls += " syncing"
       title = "Saving state to OneDrive"
       break
@@ -554,10 +452,10 @@ function updateSyncIndicator(): void {
     case "error":
       text = "sync error"
       cls += " error"
-      title = lastSyncError ?? "Failed to sync state — using local only"
+      title = lastSyncError ?? "Failed to sync state \u2014 using local only"
       break
     case "offline":
-      text = "offline · local only"
+      text = "offline \u00b7 local only"
       cls += " offline"
       title = "Could not reach OneDrive; marks stay on this device"
       break
@@ -655,8 +553,7 @@ async function pullAndMergeOneDriveState(): Promise<void> {
         updatedAt: new Date().toISOString(),
         updatedBy: deviceIdentifier(),
       })
-      rerenderChatList()
-      rerenderRecordingsList()
+      rerenderContainerList()
     } else if (!remote) {
       await saveOneDriveState(msal, local)
     }
@@ -672,9 +569,9 @@ async function pullAndMergeOneDriveState(): Promise<void> {
   }
 }
 
-// ----- Filter + sort for chats (pure) -----
+// ----- Filter + sort for containers (pure) -----
 
-function applyFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
+function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
   const q = filterState.search.trim().toLowerCase()
   let result = chats.filter((c) => {
     const isIgnored = ignoredIds.has(c.id)
@@ -687,6 +584,8 @@ function applyFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     }
     if (!filterState.enabledTypes.has(c.chatType)) return false
     if (filterState.markedOnly && !markedIds.has(c.id)) return false
+    // hideDownloaded: hide containers where the chat archive has been downloaded
+    if (userPrefs.hideDownloaded && chatPrefs[c.id]?.lastSync) return false
     if (q) {
       const name = chatDisplayName(c).toLowerCase()
       if (!name.includes(q)) return false
@@ -718,47 +617,6 @@ function countByType(chats: TeamsChatItem[]): Map<string, number> {
   return counts
 }
 
-function applyRecordingFiltersAndSort(
-  containers: RecordingContainer[],
-): RecordingContainer[] {
-  const q = recordingFilterState.search.trim().toLowerCase()
-  let result = containers.filter((c) => {
-    const markId = `rec:${c.chatId}`
-    if (recordingFilterState.markedOnly && !markedIds.has(markId)) return false
-    if (!recordingFilterState.enabledKinds.has(c.chatType)) return false
-    // Hide-downloaded: exclude containers where every recording has been synced
-    if (userPrefs.hideDownloaded && c.recordings.length > 0) {
-      const allDownloaded = c.recordings.every((r) => !!recordingPrefs[r.id]?.lastSync)
-      if (allDownloaded) return false
-    }
-    if (q) {
-      const haystack =
-        `${c.chatTopic ?? ""} ${c.recordings.map((r) => r.filename).join(" ")}`.toLowerCase()
-      if (!haystack.includes(q)) return false
-    }
-    return true
-  })
-  const mostRecentDate = (c: RecordingContainer): string =>
-    c.recordings[0]?.eventCreatedDateTime ?? ""
-  const byRecent = (a: RecordingContainer, b: RecordingContainer) =>
-    mostRecentDate(b).localeCompare(mostRecentDate(a))
-  const byName = (a: RecordingContainer, b: RecordingContainer) =>
-    (a.chatTopic ?? "").localeCompare(b.chatTopic ?? "")
-  if (recordingFilterState.sortKey === "name") {
-    result = [...result].sort(byName)
-  } else if (recordingFilterState.sortKey === "recent") {
-    result = [...result].sort(byRecent)
-  } else {
-    result = [...result].sort((a, b) => {
-      const aM = markedIds.has(`rec:${a.chatId}`) ? 1 : 0
-      const bM = markedIds.has(`rec:${b.chatId}`) ? 1 : 0
-      if (aM !== bM) return bM - aM
-      return byRecent(a, b)
-    })
-  }
-  return result
-}
-
 // ----- Render -----
 
 function render(): void {
@@ -780,11 +638,19 @@ function render(): void {
   markedIds = loadMarks(userCacheKey())
   ignoredIds = loadIgnored(userCacheKey())
   // Migrate: drop old per-recording marks that used the callId::filename composite key.
-  // They don't map to containers; re-mark at container level with the rec: prefix.
+  // Migrate: drop rec: prefix \u2014 unify recording container marks to bare chatId.
   let migratedMarks = false
   for (const id of [...markedIds]) {
     if (id.includes("::")) {
       markedIds.delete(id)
+      migratedMarks = true
+    }
+  }
+  for (const id of [...markedIds]) {
+    if (id.startsWith("rec:")) {
+      const bareId = id.slice(4)
+      markedIds.delete(id)
+      markedIds.add(bareId)
       migratedMarks = true
     }
   }
@@ -800,7 +666,7 @@ function render(): void {
       <div class="user">
         <span class="user-name">${escapeHtml(account.username)}</span>
         <span id="sync-badge" class="sync-badge idle" title="">not synced</span>
-        <button id="open-settings" class="icon-button" title="Settings" aria-label="Settings">⚙</button>
+        <button id="open-settings" class="icon-button" title="Settings" aria-label="Settings">\u2699</button>
         <button id="signout">Sign out</button>
       </div>
     </header>
@@ -809,7 +675,7 @@ function render(): void {
       <div class="modal-card" role="dialog" aria-labelledby="settings-title" aria-modal="true">
         <header class="modal-header">
           <h2 id="settings-title">Settings</h2>
-          <button id="settings-close" class="icon-button" aria-label="Close">✕</button>
+          <button id="settings-close" class="icon-button" aria-label="Close">\u2715</button>
         </header>
         <div class="modal-body">
           <label class="form-field">
@@ -844,13 +710,6 @@ function render(): void {
     </div>
     <main>
       <div class="actions actions-global">
-        <label class="sort-label">
-          Source
-          <select id="source-select">
-            <option value="teams.chats">Teams chats</option>
-            <option value="teams.recordings">Call recordings</option>
-          </select>
-        </label>
         <span class="label">to</span>
         <select id="destination" title="Where to save downloads">
           <option value="browser">Browser (save dialog)</option>
@@ -858,14 +717,14 @@ function render(): void {
         </select>
         <span class="onedrive-folder" id="onedrive-folder" hidden>
           <button class="link-button" id="edit-folder" title="Click to change">/m365-pull/teams-chats</button>
-          <a class="link-button" id="open-folder" target="_blank" rel="noopener" hidden title="Open this folder in OneDrive on the web">↗ Open</a>
+          <a class="link-button" id="open-folder" target="_blank" rel="noopener" hidden title="Open this folder in OneDrive on the web">\u2197 Open</a>
         </span>
       </div>
-      <div class="actions" id="actions-chats">
-        <button id="loadchats" class="primary">Load my Teams chats</button>
+      <div class="actions" id="actions">
+        <button id="loadchats" class="primary">Load my Teams containers</button>
         <button id="refreshchats" hidden>Refresh</button>
-        <span class="label">Show chats from:</span>
-        <select id="chat-range" title="Date range for chat list">
+        <span class="label">Show from:</span>
+        <select id="chat-range" title="Date range for container list">
           <option value="this-week">This week</option>
           <option value="last-7d" selected>Last 7 days</option>
           <option value="last-30d">Last 30 days</option>
@@ -877,40 +736,25 @@ function render(): void {
           <span class="label">to</span>
           <input type="date" id="chat-to" title="To (inclusive)" />
         </span>
-        <button class="chip" id="marked-include" title="Always show marked chats regardless of range">\u2605 Always include marked</button>
+        <button class="chip" id="marked-include" title="Always show marked containers regardless of range">\u2605 Always include marked</button>
         <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
-        <span class="label">Download history per chat:</span>
-        <select id="lookback" title="Download history per chat">
+        <span class="label">Download history:</span>
+        <select id="lookback" title="Download history per chat (messages)">
           <option value="7">Last 7 days</option>
           <option value="30" selected>Last 30 days</option>
           <option value="90">Last 90 days</option>
           <option value="all">All messages</option>
           <option value="since-last-download">Since last download</option>
         </select>
-        <button id="bulk-chats" class="bulk-action" hidden></button>
+        <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
+        <button class="chip active" id="include-messages" title="Include chat message archives when downloading a container">Include: Messages</button>
+        <button class="chip active" id="include-recordings" title="Include call transcripts when downloading a container">Include: Transcripts</button>
+        <button id="bulk-containers" class="bulk-action" hidden></button>
       </div>
-      <div class="actions" id="actions-transcripts" hidden>
-        <button id="load-recordings" class="primary">Load my recordings</button>
-        <button id="refresh-recordings" hidden>Refresh</button>
-        <span class="label">Range:</span>
-        <select id="recording-range" title="Date range for recordings">
-          <option value="this-week">This week</option>
-          <option value="last-7d" selected>Last 7 days</option>
-          <option value="last-30d">Last 30 days</option>
-          <option value="since-last-download">Since last download</option>
-          <option value="custom">Custom range\u2026</option>
-        </select>
-        <span id="custom-range-inputs" class="custom-range" hidden>
-          <input type="date" id="recording-from" title="From (inclusive)" />
-          <span class="label">to</span>
-          <input type="date" id="recording-to" title="To (inclusive)" />
-        </span>
-        <button class="chip" id="rec-marked-include" title="Always show marked containers regardless of range">\u2605 Always include marked</button>
-        <button id="bulk-recordings" class="bulk-action" hidden></button>
-      </div>
+      <div id="scan-status" class="scan-status"></div>
 
       <div class="filters" id="filters" hidden>
-        <input id="search" type="search" placeholder="Search chats by name…" />
+        <input id="search" type="search" placeholder="Search containers by name\u2026" />
         <div class="chips" id="type-chips">
           ${KNOWN_TYPES.map(
             (t) =>
@@ -920,46 +764,26 @@ function render(): void {
         <label class="sort-label">
           Sort
           <select id="sortby">
-            <option value="marked-first">Marked first · then recent</option>
+            <option value="marked-first">Marked first \u00b7 then recent</option>
             <option value="recent">Most recent activity</option>
-            <option value="name">Name (A–Z)</option>
+            <option value="name">Name (A\u2013Z)</option>
           </select>
         </label>
-        <button class="chip marked-only" id="markedonly">★ Marked only</button>
-        <button class="chip show-ignored" id="showignored">⊘ Show ignored</button>
-        <button class="chip clear-ignored" id="clearignored" hidden>⊘ Clear all ignored</button>
-      </div>
-      <div class="filters" id="filters-recordings" hidden>
-        <input id="search-recordings" type="search" placeholder="Search recordings by topic or filename…" />
-        <div class="chips" id="kind-chips">
-          ${CHAT_TYPE_KINDS.map(
-            (k) =>
-              `<button class="chip active" data-kind="${k.id}">${escapeHtml(k.label)} <span class="chip-count">0</span></button>`,
-          ).join("")}
-        </div>
-        <label class="sort-label">
-          Sort
-          <select id="sortby-recordings">
-            <option value="marked-first">Marked first · then recent</option>
-            <option value="recent">Most recent</option>
-            <option value="name">Subject (A–Z)</option>
-          </select>
-        </label>
-        <button class="chip marked-only" id="markedonly-recordings">★ Marked only</button>
+        <button class="chip marked-only" id="markedonly">\u2605 Marked only</button>
+        <button class="chip show-ignored" id="showignored">\u2298 Show ignored</button>
+        <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear all ignored</button>
         <button class="chip" id="hide-downloaded">Hide downloaded</button>
       </div>
       <div id="status"></div>
       <ul id="chats" class="chat-list"></ul>
-      <ul id="recordings" class="chat-list" hidden></ul>
     </main>
   `
 
   wireGlobalHandlers(account)
   syncUIControlsFromState()
   updateSyncIndicator()
-  applySourceVisibility()
 
-  void pullAndMergeOneDriveState().then(() => rerenderChatList())
+  void pullAndMergeOneDriveState().then(() => rerenderContainerList())
 }
 
 function wireGlobalHandlers(account: AccountInfo): void {
@@ -967,98 +791,20 @@ function wireGlobalHandlers(account: AccountInfo): void {
     void msal.logoutRedirect({ account })
   })
 
-  // Source switcher
-  const sourceSel = el<HTMLSelectElement>("source-select")
-  sourceSel.value = currentSource
-  sourceSel.addEventListener("change", () => {
-    currentSource = sourceSel.value as SourceId
-    applySourceVisibility()
-    saveUIPrefs()
-  })
-
-  // Chats actions -- ensure source state matches before running
+  // Container load / refresh
   el<HTMLButtonElement>("loadchats").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.chats")
     void initialLoadChats()
   })
   el<HTMLButtonElement>("refreshchats").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.chats")
     void refreshChats()
   })
 
-  // Transcripts actions
-  el<HTMLButtonElement>("load-recordings").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.recordings")
-    void initialLoadRecordings()
-  })
-  el<HTMLButtonElement>("refresh-recordings").addEventListener("click", () => {
-    switchSourceIfNeeded("teams.recordings")
-    void refreshRecordings()
+  // Bulk sync button
+  el<HTMLButtonElement>("bulk-containers").addEventListener("click", () => {
+    void bulkSyncContainers()
   })
 
-  // Bulk download buttons
-  el<HTMLButtonElement>("bulk-chats").addEventListener("click", () => {
-    void bulkDownloadChats()
-  })
-  el<HTMLButtonElement>("bulk-recordings").addEventListener("click", () => {
-    void bulkDownloadRecordings()
-  })
-  // Recording range dropdown + custom date inputs — persisted to OneDrive userPrefs
-  el<HTMLSelectElement>("recording-range").addEventListener("change", () => {
-    const kind = el<HTMLSelectElement>("recording-range").value as RecordingRange["kind"]
-    const customEl = el<HTMLSpanElement>("custom-range-inputs")
-    customEl.hidden = kind !== "custom"
-    if (kind === "custom") {
-      // Default date inputs when first revealed
-      const fromEl = el<HTMLInputElement>("recording-from")
-      const toEl = el<HTMLInputElement>("recording-to")
-      if (!fromEl.value) fromEl.value = toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
-      if (!toEl.value) toEl.value = toLocalDateString(new Date())
-      userPrefs = { ...userPrefs, recordingRange: {
-        kind,
-        customFrom: fromEl.value || undefined,
-        customTo: toEl.value || undefined,
-      } }
-    } else {
-      userPrefs = { ...userPrefs, recordingRange: { kind } }
-    }
-    saveUserPrefs(userCacheKey(), userPrefs)
-    scheduleOneDriveSave()
-    // If recordings have already been loaded, reload with the new range
-    if (!el<HTMLButtonElement>("refresh-recordings").hidden) {
-      void refreshRecordings()
-    }
-  })
-
-  const applyCustomRange = () => {
-    const fromEl = document.getElementById("recording-from") as HTMLInputElement | null
-    const toEl = document.getElementById("recording-to") as HTMLInputElement | null
-    userPrefs = { ...userPrefs, recordingRange: {
-      kind: "custom",
-      customFrom: fromEl?.value || undefined,
-      customTo: toEl?.value || undefined,
-    } }
-    saveUserPrefs(userCacheKey(), userPrefs)
-    scheduleOneDriveSave()
-    // If recordings have already been loaded, reload with the new range
-    if (!el<HTMLButtonElement>("refresh-recordings").hidden) {
-      void refreshRecordings()
-    }
-  }
-  el<HTMLInputElement>("recording-from").addEventListener("change", applyCustomRange)
-  el<HTMLInputElement>("recording-to").addEventListener("change", applyCustomRange)
-
-  el<HTMLButtonElement>("hide-downloaded").addEventListener("click", () => {
-    const next = !userPrefs.hideDownloaded
-    userPrefs = { ...userPrefs, hideDownloaded: next }
-    el<HTMLButtonElement>("hide-downloaded").classList.toggle("active", next)
-    saveUserPrefs(userCacheKey(), userPrefs)
-    scheduleOneDriveSave()
-    rerenderRecordingsList()
-  })
-
-  // Chat range dropdown + custom date inputs — controls the list window; persisted
-  // to OneDrive userPrefs (cross-device), mirroring the recording range pattern.
+  // Chat range dropdown + custom date inputs \u2014 persisted to OneDrive userPrefs
   el<HTMLSelectElement>("chat-range").addEventListener("change", () => {
     const kind = el<HTMLSelectElement>("chat-range").value as ChatRange["kind"]
     const chatCustomEl = el<HTMLSpanElement>("chat-custom-range-inputs")
@@ -1082,6 +828,10 @@ function wireGlobalHandlers(account: AccountInfo): void {
     if (!el<HTMLButtonElement>("refreshchats").hidden) {
       clearCachedChats(userCacheKey())
       chatsState = { chats: [] }
+      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
+      recordingsMap = new Map()
+      recordingsPending = false
+      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
@@ -1100,6 +850,10 @@ function wireGlobalHandlers(account: AccountInfo): void {
     if (!el<HTMLButtonElement>("refreshchats").hidden) {
       clearCachedChats(userCacheKey())
       chatsState = { chats: [] }
+      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
+      recordingsMap = new Map()
+      recordingsPending = false
+      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
@@ -1107,7 +861,7 @@ function wireGlobalHandlers(account: AccountInfo): void {
   el<HTMLInputElement>("chat-from").addEventListener("change", applyCustomChatRange)
   el<HTMLInputElement>("chat-to").addEventListener("change", applyCustomChatRange)
 
-  // Marked-include toggle — persisted to OneDrive userPrefs; default ON.
+  // Marked-include toggle \u2014 persisted to OneDrive userPrefs; default ON.
   el<HTMLButtonElement>("marked-include").addEventListener("click", () => {
     const next = userPrefs.markedInclude === false ? true : false
     userPrefs = { ...userPrefs, markedInclude: next }
@@ -1118,82 +872,56 @@ function wireGlobalHandlers(account: AccountInfo): void {
     if (!el<HTMLButtonElement>("refreshchats").hidden) {
       clearCachedChats(userCacheKey())
       chatsState = { chats: [] }
+      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
+      recordingsMap = new Map()
+      recordingsPending = false
+      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
   })
 
-  // Recording marked-include toggle — default ON; triggers reload when recordings are loaded.
-  const recMarkedIncludeBtn = document.getElementById("rec-marked-include") as HTMLButtonElement | null
-  if (recMarkedIncludeBtn) {
-    recMarkedIncludeBtn.addEventListener("click", () => {
-      const next = userPrefs.recordingMarkedInclude === false ? true : false
-      userPrefs = { ...userPrefs, recordingMarkedInclude: next }
-      recMarkedIncludeBtn.classList.toggle("active", next)
-      saveUserPrefs(userCacheKey(), userPrefs)
-      scheduleOneDriveSave()
-      if (!el<HTMLButtonElement>("refresh-recordings").hidden) {
-        void refreshRecordings()
-      }
-    })
-  }
+  // Include-messages toggle \u2014 gates whether messages are synced on container download.
+  el<HTMLButtonElement>("include-messages").addEventListener("click", () => {
+    const next = userPrefs.includeMessages === false ? true : false
+    userPrefs = { ...userPrefs, includeMessages: next }
+    el<HTMLButtonElement>("include-messages").classList.toggle("active", next)
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+  })
 
-  // Chat lookback: persists the download-depth selection only. The list window
-  // is now owned by the chat-range selector above.
+  // Include-recordings toggle \u2014 gates whether transcripts are synced on container download.
+  el<HTMLButtonElement>("include-recordings").addEventListener("click", () => {
+    const next = userPrefs.includeRecordings === false ? true : false
+    userPrefs = { ...userPrefs, includeRecordings: next }
+    el<HTMLButtonElement>("include-recordings").classList.toggle("active", next)
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+  })
+
+  // Chat lookback: persists the download-depth selection only.
   el<HTMLSelectElement>("lookback").addEventListener("change", () => {
     saveUIPrefs()
   })
 
-  // Meeting filters
-  const searchMeetings = el<HTMLInputElement>("search-recordings")
-  let searchMeetingsTimer: number | null = null
-  searchMeetings.addEventListener("input", () => {
-    if (searchMeetingsTimer) window.clearTimeout(searchMeetingsTimer)
-    searchMeetingsTimer = window.setTimeout(() => {
-      recordingFilterState.search = searchMeetings.value
-      rerenderRecordingsList()
-      saveUIPrefs()
-    }, 150)
+  // Hide-downloaded toggle
+  el<HTMLButtonElement>("hide-downloaded").addEventListener("click", () => {
+    const next = !userPrefs.hideDownloaded
+    userPrefs = { ...userPrefs, hideDownloaded: next }
+    el<HTMLButtonElement>("hide-downloaded").classList.toggle("active", next)
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    rerenderContainerList()
   })
-  el<HTMLSelectElement>("sortby-recordings").addEventListener("change", (e) => {
-    recordingFilterState.sortKey = (e.target as HTMLSelectElement).value as SortKey
-    rerenderRecordingsList()
-    saveUIPrefs()
-  })
-  el<HTMLButtonElement>("markedonly-recordings").addEventListener("click", () => {
-    recordingFilterState.markedOnly = !recordingFilterState.markedOnly
-    el<HTMLButtonElement>("markedonly-recordings").classList.toggle(
-      "active",
-      recordingFilterState.markedOnly,
-    )
-    rerenderRecordingsList()
-    saveUIPrefs()
-  })
-  el<HTMLDivElement>("kind-chips")
-    .querySelectorAll<HTMLButtonElement>(".chip[data-kind]")
-    .forEach((chip) => {
-      chip.addEventListener("click", () => {
-        const k = chip.dataset.kind as ChatType
-        if (recordingFilterState.enabledKinds.has(k)) {
-          recordingFilterState.enabledKinds.delete(k)
-          chip.classList.remove("active")
-        } else {
-          recordingFilterState.enabledKinds.add(k)
-          chip.classList.add("active")
-        }
-        rerenderRecordingsList()
-        saveUIPrefs()
-      })
-    })
 
-  // Chats filters
+  // Container filters
   const search = el<HTMLInputElement>("search")
   let searchTimer: number | null = null
   search.addEventListener("input", () => {
     if (searchTimer) window.clearTimeout(searchTimer)
     searchTimer = window.setTimeout(() => {
       filterState.search = search.value
-      rerenderChatList()
+      rerenderContainerList()
       saveUIPrefs()
     }, 150)
   })
@@ -1209,13 +937,13 @@ function wireGlobalHandlers(account: AccountInfo): void {
           filterState.enabledTypes.add(t)
           chip.classList.add("active")
         }
-        rerenderChatList()
+        rerenderContainerList()
         saveUIPrefs()
       })
     })
   el<HTMLSelectElement>("sortby").addEventListener("change", (e) => {
     filterState.sortKey = (e.target as HTMLSelectElement).value as SortKey
-    rerenderChatList()
+    rerenderContainerList()
     saveUIPrefs()
   })
   el<HTMLButtonElement>("markedonly").addEventListener("click", () => {
@@ -1224,27 +952,22 @@ function wireGlobalHandlers(account: AccountInfo): void {
       "active",
       filterState.markedOnly,
     )
-    rerenderChatList()
+    rerenderContainerList()
     saveUIPrefs()
   })
 
-  // Show ignored toggle — mirrors "Marked only"; turns the list into an
-  // ignored-chats view where each row has an un-ignore affordance.
+  // Show ignored toggle
   el<HTMLButtonElement>("showignored").addEventListener("click", () => {
     filterState.showIgnored = !filterState.showIgnored
     el<HTMLButtonElement>("showignored").classList.toggle(
       "active",
       filterState.showIgnored,
     )
-    rerenderChatList()
+    rerenderContainerList()
     saveUIPrefs()
   })
 
-  // Clear all ignored — removes every ignored id via the SAME removal path as
-  // single un-ignore (delete from set → saveIgnored → rerender → schedule a
-  // OneDrive overwrite). The overwrite (last-writer-wins, see saveOneDriveState)
-  // is what makes removal stick; a raw localStorage wipe would be re-unioned
-  // back on the next pull (mergeStates unions ignored sets).
+  // Clear all ignored
   el<HTMLButtonElement>("clearignored").addEventListener("click", () => {
     clearAllIgnored()
   })
@@ -1261,7 +984,7 @@ function wireGlobalHandlers(account: AccountInfo): void {
     syncUserPrefsToUI()
     scheduleOneDriveSave()
   })
-  // Inline folder label opens Settings (replaced the old prompt() editor)
+  // Inline folder label opens Settings
   el<HTMLButtonElement>("edit-folder").addEventListener("click", () => {
     openSettingsModal()
   })
@@ -1294,30 +1017,13 @@ function wireGlobalHandlers(account: AccountInfo): void {
   window.setInterval(updateSyncIndicator, 30_000)
 }
 
-/** Coerce source state to match the action the user just took. If they clicked
- * a button belonging to a different source (e.g. Load my meetings while still
- * on chats), switch the source for them and update the UI. */
-function switchSourceIfNeeded(wanted: SourceId): void {
-  if (currentSource === wanted) return
-  currentSource = wanted
-  const sourceSel = document.getElementById("source-select") as
-    | HTMLSelectElement
-    | null
-  if (sourceSel) sourceSel.value = wanted
-  applySourceVisibility()
-  saveUIPrefs()
-}
-
 /** Read module state and stash it in localStorage so reloads remember
- * the user's dropdown selections, chip filters, and source choice.
- * Note: lookback persists the message-download-depth selection; the list
- * window range is owned by userPrefs.chatRange (synced to OneDrive). */
+ * the user's dropdown selections and chip filters. */
 function saveUIPrefs(): void {
   const lookbackEl = document.getElementById("lookback") as
     | HTMLSelectElement
     | null
   saveUIState(userCacheKey(), {
-    currentSource,
     lookback: lookbackEl?.value,
     chatFilter: {
       search: filterState.search,
@@ -1326,22 +1032,13 @@ function saveUIPrefs(): void {
       markedOnly: filterState.markedOnly,
       showIgnored: filterState.showIgnored,
     },
-    recordingFilter: {
-      search: recordingFilterState.search,
-      enabledKinds: [...recordingFilterState.enabledKinds],
-      sortKey: recordingFilterState.sortKey,
-      markedOnly: recordingFilterState.markedOnly,
-    },
   })
 }
 
-/** Restore filter state, source choice, and dropdown values from localStorage.
+/** Restore filter state and dropdown values from localStorage.
  * Runs after the HTML is rendered (handlers wired later read these values). */
 function hydrateUIStateFromStorage(): void {
   const saved = loadUIState(userCacheKey())
-  if (saved.currentSource === "teams.chats" || saved.currentSource === "teams.recordings") {
-    currentSource = saved.currentSource
-  }
   if (saved.chatFilter) {
     filterState = {
       search: saved.chatFilter.search ?? "",
@@ -1353,33 +1050,15 @@ function hydrateUIStateFromStorage(): void {
       showIgnored: saved.chatFilter.showIgnored ?? false,
     }
   }
-  if (saved.recordingFilter) {
-    recordingFilterState = {
-      search: saved.recordingFilter.search ?? "",
-      enabledKinds: new Set(
-        (saved.recordingFilter.enabledKinds ?? CHAT_TYPE_KINDS.map((k) => k.id)).filter(
-          (k): k is ChatType => k === "oneOnOne" || k === "group" || k === "meeting",
-        ),
-      ),
-      sortKey: saved.recordingFilter.sortKey ?? "marked-first",
-      markedOnly: saved.recordingFilter.markedOnly ?? false,
-    }
-  }
-  // Note: lookback dropdown value is restored in syncUIControlsFromState
-  // (called after handlers are wired and the DOM is interactive).
 }
 
 /** Push module state into the freshly-rendered DOM controls. Called once
  * after wireGlobalHandlers so handler-attached defaults don't fight us. */
 function syncUIControlsFromState(): void {
   const saved = loadUIState(userCacheKey())
-  // Source dropdown
-  const sourceSel = document.getElementById("source-select") as HTMLSelectElement | null
-  if (sourceSel) sourceSel.value = currentSource
-  // Chat lookback (download depth only — list range is synced via syncUserPrefsToUI)
+  // Chat lookback (download depth only \u2014 list range is synced via syncUserPrefsToUI)
   const lookbackEl = document.getElementById("lookback") as HTMLSelectElement | null
   if (lookbackEl && saved.lookback) lookbackEl.value = saved.lookback
-  // Recording range + chat range are synced via syncUserPrefsToUI (called from wireGlobalHandlers)
   // Chat filter UI: search, sortby, type chips, markedonly
   const searchEl = document.getElementById("search") as HTMLInputElement | null
   if (searchEl) searchEl.value = filterState.search
@@ -1396,59 +1075,32 @@ function syncUIControlsFromState(): void {
       const enabled = t ? filterState.enabledTypes.has(t) : true
       chip.classList.toggle("active", enabled)
     })
-  // Meeting filter UI: search, sortby, kind chips, markedonly
-  const searchMeetingsEl = document.getElementById("search-recordings") as HTMLInputElement | null
-  if (searchMeetingsEl) searchMeetingsEl.value = recordingFilterState.search
-  const sortbyMeetingsEl = document.getElementById("sortby-recordings") as HTMLSelectElement | null
-  if (sortbyMeetingsEl) sortbyMeetingsEl.value = recordingFilterState.sortKey
-  const markedOnlyMeetings = document.getElementById("markedonly-recordings")
-  if (markedOnlyMeetings)
-    markedOnlyMeetings.classList.toggle("active", recordingFilterState.markedOnly)
-  document
-    .querySelectorAll<HTMLButtonElement>("#kind-chips .chip[data-kind]")
-    .forEach((chip) => {
-      const k = chip.dataset.kind as ChatType | undefined
-      const enabled = k ? recordingFilterState.enabledKinds.has(k) : true
-      chip.classList.toggle("active", enabled)
-    })
 }
 
-function applySourceVisibility(): void {
-  const isChats = currentSource === "teams.chats"
-  el<HTMLDivElement>("actions-chats").hidden = !isChats
-  el<HTMLDivElement>("actions-transcripts").hidden = isChats
-  el<HTMLUListElement>("chats").hidden = !isChats
-  el<HTMLUListElement>("recordings").hidden = isChats
-  updateFiltersVisibility()
-  if (isChats) {
-    updateMatchSummary(applyFiltersAndSort(chatsState.chats).length)
-  } else {
-    updateRecordingsSummary()
-  }
-}
+// ----- Container list rendering -----
 
-// ----- Chat list rendering -----
-
-function rerenderChatList(): void {
+function rerenderContainerList(): void {
   const list = el<HTMLUListElement>("chats")
-  const filtered = applyFiltersAndSort(chatsState.chats)
+  const filtered = applyContainerFiltersAndSort(chatsState.chats)
   if (chatsState.chats.length === 0) {
     list.innerHTML = ""
     return
   }
   if (filtered.length === 0) {
-    list.innerHTML = `<li class="empty">No chats match these filters. ${
+    list.innerHTML = `<li class="empty">No containers match these filters. ${
       filterState.markedOnly
-        ? "Star some chats from the list to add them here."
+        ? "Star some containers from the list to add them here."
         : "Loosen the filters."
     }</li>`
   } else {
-    list.innerHTML = filtered.map(renderChatRow).join("")
-    list.querySelectorAll<HTMLButtonElement>(".chat-action").forEach((btn) => {
+    list.innerHTML = filtered
+      .map((c) => renderContainerRow(c, recordingsMap.get(c.id)))
+      .join("")
+    list.querySelectorAll<HTMLButtonElement>(".container-action").forEach((btn) => {
       btn.addEventListener("click", () => {
         const id = btn.dataset.chatId!
         const name = btn.dataset.chatName!
-        void downloadChat(id, name, btn)
+        void syncContainer(id, name, btn)
       })
     })
     list.querySelectorAll<HTMLButtonElement>(".mark-toggle").forEach((btn) => {
@@ -1464,88 +1116,148 @@ function rerenderChatList(): void {
   }
   updateTypeCountChips()
   updateFiltersVisibility()
-  if (currentSource === "teams.chats") updateMatchSummary(filtered.length)
+  updateContainerSummary(filtered.length)
   updateBulkButtons()
 }
 
-function updateMatchSummary(visible: number): void {
+function updateContainerSummary(visible: number): void {
   const total = chatsState.chats.length
   const marked = markedIds.size
   const ignored = ignoredIds.size
-  const ignoredNote = ignored > 0 ? ` · ${ignored} ignored` : ""
+  const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} ignored` : ""
   // "Clear all ignored" is only relevant when something is ignored.
   const clearBtn = document.getElementById("clearignored") as HTMLButtonElement | null
   if (clearBtn) clearBtn.hidden = ignored === 0
+  // Recording scan progress lives in #scan-status (Item 4); omit from main status.
   const filtered = visible < total
   if (filtered) {
-    setStatus(`Showing ${visible} of ${total} loaded · ${marked} marked${ignoredNote}`)
+    setStatus(`Showing ${visible} of ${total} loaded \u00b7 ${marked} marked${ignoredNote}`)
   } else {
-    setStatus(`${total} chats loaded · ${marked} marked${ignoredNote}`)
+    setStatus(`${total} containers loaded \u00b7 ${marked} marked${ignoredNote}`)
   }
 }
 
-function renderChatRow(chat: TeamsChatItem): string {
+function renderContainerRow(
+  chat: TeamsChatItem,
+  recContainer: RecordingContainer | undefined,
+): string {
   const name = chatDisplayName(chat)
   const isMarked = markedIds.has(chat.id)
   const isIgnored = ignoredIds.has(chat.id)
   const lastSync = chatPrefs[chat.id]?.lastSync
+  // Item 5: capitalise "Downloaded"; make no-download state explicit.
   const downloadedTag = lastSync
-    ? ` · downloaded ${formatDateShort(new Date(lastSync))}`
-    : ""
-  const sub = `${typeLabel(chat.chatType)} · last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
+    ? ` \u00b7 Downloaded ${formatDateShort(new Date(lastSync))}`
+    : " \u00b7 Not downloaded yet"
+  const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
+
+  // Item 1: four honest recording indicator states.
+  // The \uD83C\uDF99 (🎙) glyph is decorative — hidden from AT via aria-hidden="true" on the
+  // inner span; meaning is carried by the outer span's aria-label.
+  let recIndicatorHtml: string
+  if (recContainer !== undefined && recContainer.recordings.length > 0) {
+    // State A: scan finished, has recordings
+    const n = recContainer.recordings.length
+    const truncNote = recContainer.truncated ? " (may be incomplete)" : ""
+    recIndicatorHtml = `<span class="rec-indicator" aria-label="${n} recording${n !== 1 ? "s" : ""}${truncNote}" title="${n} recording${n !== 1 ? "s" : ""} in range${truncNote}"><span aria-hidden="true">\uD83C\uDF99 ${n}</span></span>`
+  } else if (recordingsPending && recContainer === undefined) {
+    // State B: scan in progress, no result yet for this chat
+    recIndicatorHtml = `<span class="rec-indicator rec-pending" aria-label="checking for recordings" title="Checking for recordings\u2026"><span aria-hidden="true">\uD83C\uDF99 checking\u2026</span></span>`
+  } else if (recordingsScanFinished && recContainer !== undefined && recContainer.recordings.length === 0) {
+    // State C: scan done, confirmed no recordings in range
+    recIndicatorHtml = `<span class="rec-indicator rec-none" aria-label="no recordings" title="No recordings in range"><span aria-hidden="true">\uD83C\uDF99 none</span></span>`
+  } else if (recordingsScanFinished && recContainer === undefined) {
+    // State D: scan done, no entry — couldn't determine (~60% of meeting chats).
+    // No cheap single-container resolve path available; rendered as a non-interactive marker.
+    recIndicatorHtml = `<span class="rec-indicator rec-unknown" aria-label="recordings unknown \u2014 could not resolve" title="Could not determine recordings for this chat"><span aria-hidden="true">\uD83C\uDF99 ?</span></span>`
+  } else {
+    // Scan not yet started (chats loaded before scan kicked off) — treat same as pending.
+    recIndicatorHtml = `<span class="rec-indicator rec-pending" aria-label="checking for recordings" title="Checking for recordings\u2026"><span aria-hidden="true">\uD83C\uDF99 checking\u2026</span></span>`
+  }
+
+  // Item 3: effective download scope = toggles ∩ what this row actually has.
+  const wantMessages = userPrefs.includeMessages !== false
+  const hasRecordings = recContainer !== undefined && recContainer.recordings.length > 0
+  const wantRecordings = userPrefs.includeRecordings !== false && hasRecordings
+  let downloadBtnInner: string
+  let downloadBtnDisabled = ""
+  let downloadBtnTitle = ""
+  let downloadBtnAriaLabel: string
+  if (wantMessages && wantRecordings) {
+    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC\uD83C\uDF99</span>`
+    downloadBtnAriaLabel = "Download messages and recordings"
+  } else if (wantMessages) {
+    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC</span>`
+    downloadBtnAriaLabel = "Download messages"
+  } else if (wantRecordings) {
+    downloadBtnInner = `Download <span aria-hidden="true">\uD83C\uDF99</span>`
+    downloadBtnAriaLabel = "Download recordings"
+  } else {
+    downloadBtnInner = "Download"
+    downloadBtnDisabled = " disabled"
+    downloadBtnTitle = ` title="Nothing to download for current Include settings"`
+    downloadBtnAriaLabel = "Download \u2014 nothing to download for current Include settings"
+  }
+
+  // Item 2: aria-pressed reflects toggle state for screen readers.
   return `
     <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}">
-      <button class="mark-toggle${isMarked ? " marked" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Unmark" : "Mark"} this chat" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "\u2605" : "\u2606"}</button>
+      <button class="mark-toggle${isMarked ? " marked" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Remove keep mark" : "Keep this container"}" aria-label="${isMarked ? "Remove keep mark" : "Keep"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>
       <div class="chat-info">
         <div class="chat-name">${escapeHtml(name)}</div>
         <div class="chat-sub">${escapeHtml(sub)}</div>
       </div>
-      <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore" : "Ignore"} this chat" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-      <button class="chat-action" data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}">Download</button>
+      ${recIndicatorHtml}
+      <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
+      <button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>
     </li>
   `
 }
 
-/** Toggle a mark on any item (chat or meeting). The id format is distinct
- * between sources, so a single Set works. We rerender both lists because
- * the cost is negligible at typical loaded sizes and we don't need to know
- * which kind of id this is. */
+/** Toggle a mark on a container (bare chatId). Marking clears the ignored state (tri-state axis). */
 function toggleMark(id: string): void {
-  if (markedIds.has(id)) markedIds.delete(id)
-  else markedIds.add(id)
+  if (markedIds.has(id)) {
+    markedIds.delete(id)
+  } else {
+    markedIds.add(id)
+    // Item 2: Keep and Ignore are mutually exclusive (tri-state: Kept / Inbox / Ignored).
+    if (ignoredIds.has(id)) {
+      ignoredIds.delete(id)
+      saveIgnored(userCacheKey(), ignoredIds)
+    }
+  }
   saveMarks(userCacheKey(), markedIds)
-  rerenderChatList()
-  rerenderRecordingsList()
+  rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
 }
 
-// Timer for the transient undo affordance shown after ignoring a chat.
+// Timer for the transient undo affordance shown after ignoring a container.
 let undoIgnoreTimer: number | null = null
 let undoIgnoreId: string | null = null
 
-/** Toggle the ignored state for a chat. Hiding is immediate; un-ignore is
- * available via the "Show ignored" view or via the transient undo affordance. */
+/** Toggle the ignored state for a container. Ignoring clears the keep mark (tri-state axis). */
 function toggleIgnore(id: string): void {
   const wasIgnored = ignoredIds.has(id)
   if (wasIgnored) {
     ignoredIds.delete(id)
   } else {
     ignoredIds.add(id)
+    // Item 2: Keep and Ignore are mutually exclusive (tri-state: Kept / Inbox / Ignored).
+    if (markedIds.has(id)) {
+      markedIds.delete(id)
+      saveMarks(userCacheKey(), markedIds)
+    }
   }
   saveIgnored(userCacheKey(), ignoredIds)
-  rerenderChatList()
+  rerenderContainerList()
   scheduleOneDriveSave()
 
-  // Undo affordance: show a transient "Chat ignored. Undo" message in the
-  // status bar for 5 seconds. Any subsequent setStatus() call clears it
-  // (textContent overwrites innerHTML), so the undo disappears naturally
-  // when the user performs another action.
   if (!wasIgnored) {
     if (undoIgnoreTimer !== null) window.clearTimeout(undoIgnoreTimer)
     undoIgnoreId = id
     const chatItem = chatsState.chats.find((c) => c.id === id)
-    const label = chatItem ? `"${escapeHtml(chatDisplayName(chatItem))}"` : "Chat"
+    const label = chatItem ? `"${escapeHtml(chatDisplayName(chatItem))}"` : "Container"
     const statusEl = document.getElementById("status")
     if (statusEl) {
       statusEl.innerHTML = `${label} ignored. <button class="link-button" id="undo-ignore">Undo</button>`
@@ -1560,7 +1272,7 @@ function toggleIgnore(id: string): void {
               undoIgnoreTimer = null
             }
             saveIgnored(userCacheKey(), ignoredIds)
-            rerenderChatList()
+            rerenderContainerList()
             scheduleOneDriveSave()
             setStatus("")
           }
@@ -1575,16 +1287,10 @@ function toggleIgnore(id: string): void {
   }
 }
 
-/** Remove ALL ignored ids at once, via the SAME removal primitives that single
- * un-ignore uses: clear the in-memory set → saveIgnored (localStorage) →
- * rerender → scheduleOneDriveSave. The OneDrive save overwrites state.json
- * (last-writer-wins) with `ignored: undefined`, so the cleared set propagates
- * cross-device. A raw localStorage wipe would NOT work — mergeStates unions
- * ignored sets on the next pull and would resurrect them. */
+/** Remove ALL ignored ids at once. */
 function clearAllIgnored(): void {
   if (ignoredIds.size === 0) return
   const count = ignoredIds.size
-  // Cancel any pending single-undo so it can't re-add a now-cleared id.
   if (undoIgnoreTimer !== null) {
     window.clearTimeout(undoIgnoreTimer)
     undoIgnoreTimer = null
@@ -1592,9 +1298,9 @@ function clearAllIgnored(): void {
   undoIgnoreId = null
   ignoredIds = new Set()
   saveIgnored(userCacheKey(), ignoredIds)
-  rerenderChatList()
+  rerenderContainerList()
   scheduleOneDriveSave()
-  setStatus(`Cleared ${count} ignored chat${count === 1 ? "" : "s"}.`)
+  setStatus(`Cleared ${count} ignored container${count === 1 ? "" : "s"}.`)
 }
 
 function updateTypeCountChips(): void {
@@ -1610,10 +1316,7 @@ function updateTypeCountChips(): void {
 }
 
 function updateFiltersVisibility(): void {
-  el<HTMLDivElement>("filters").hidden =
-    currentSource !== "teams.chats" || chatsState.chats.length === 0
-  el<HTMLDivElement>("filters-recordings").hidden =
-    currentSource !== "teams.recordings" || recordingsState.containers.length === 0
+  el<HTMLDivElement>("filters").hidden = chatsState.chats.length === 0
 }
 
 function showChatsRefreshButton(): void {
@@ -1628,13 +1331,13 @@ async function initialLoadChats(): Promise<void> {
   const cached = loadCachedChats(userKey)
   if (cached && cached.chats.length > 0) {
     chatsState = { chats: cached.chats }
-    rerenderChatList()
+    rerenderContainerList()
     showChatsRefreshButton()
     setStatus(
-      `Showing ${cached.chats.length} cached chats from ${formatAge(ageMs(cached))}. Refreshing…`,
+      `Showing ${cached.chats.length} cached containers from ${formatAge(ageMs(cached))}. Refreshing\u2026`,
     )
   } else {
-    setStatus("Loading chats…")
+    setStatus("Loading containers\u2026")
     el<HTMLUListElement>("chats").innerHTML = ""
   }
   const loadBtn = el<HTMLButtonElement>("loadchats")
@@ -1642,33 +1345,10 @@ async function initialLoadChats(): Promise<void> {
   loadBtn.disabled = true
   refreshBtn.disabled = true
 
-  // Determine recency window from the dedicated chat-range selector (stored in
-  // userPrefs.chatRange, synced cross-device via OneDrive). The old
-  // lookback-as-window stopgap is gone; lookback now owns only download depth.
   const range: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
   const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
   const rangeStr = chatRangeLabel(range, chatPrefs)
 
-  // PROVEN METHOD — validated against a working reference implementation and a
-  // live probe (80 chats for a 7-day window in ~5 pages, ZERO per-chat calls):
-  //
-  // (a) No per-chat enrichment: we derive chatActivityDate() from
-  //     lastMessagePreview.createdDateTime when messageType === "message".
-  //     lastUpdatedDateTime is intentionally NOT used for filtering/sorting
-  //     because Graph bumps it on system events (membersDeleted, callEnded,
-  //     etc.) — 33 of 40 sampled "recent" chats were phantoms from org
-  //     departures stamped today (probe 2026-06-11). Accepted gap: rare
-  //     deeply-stale 1:1s (months-silent, one recent msg) may sit below the
-  //     stop point and won't appear — explicit, accepted cost.
-  //
-  // (b) Jitter-tolerant stop: Graph's chat ordering is non-monotonic and
-  //     unstable between requests (87 ordering violations measured in the probe).
-  //     Stopping on a SINGLE out-of-window page is fragile — one stale chat at
-  //     a page boundary caused a prior run to stop at page 1 with only 13
-  //     results. We stop after 2 CONSECUTIVE pages where ALL items are BELOW
-  //     cutoffMs. Items above untilMs (custom past-range upper bound) don't
-  //     trigger the stop — we may not have reached the window yet.
-  //     30-page hard cap as backstop.
   const kept: TeamsChatItem[] = []
   let cursor: string | null = null
   let consecutiveOutOfWindowPages = 0
@@ -1686,9 +1366,6 @@ async function initialLoadChats(): Promise<void> {
         return t >= cutoffMs && t <= untilMs
       })
 
-      // Only count a page as "out of window" if ALL items are BELOW the lower
-      // bound (cutoffMs). Items that are too recent (> untilMs, custom range)
-      // don't mean we've passed the window — we just haven't gotten there yet.
       const allBelowCutoff = page.chats.every(
         (c) => chatActivityDate(c) < cutoffMs,
       )
@@ -1699,14 +1376,11 @@ async function initialLoadChats(): Promise<void> {
       } else if (allBelowCutoff) {
         consecutiveOutOfWindowPages++
       } else {
-        // Items at/above cutoffMs exist but none in [cutoffMs, untilMs] —
-        // keep paging (we haven't reached the window's lower edge yet).
         consecutiveOutOfWindowPages = 0
       }
 
-      setStatus(`Loading recent chats… (${kept.length} in window so far)`)
+      setStatus(`Loading recent containers\u2026 (${kept.length} in window so far)`)
 
-      // Jitter-tolerant stop: 2 consecutive fully-below-cutoff pages.
       if (consecutiveOutOfWindowPages >= 2) {
         cursor = null
       }
@@ -1719,15 +1393,14 @@ async function initialLoadChats(): Promise<void> {
       const keptIds = new Set(kept.map((c) => c.id))
       const missingMarked = [...markedIds].filter((id) => !keptIds.has(id))
       if (missingMarked.length > 0) {
-        setStatus(`Fetching ${missingMarked.length} marked chat(s) outside window…`)
+        setStatus(`Fetching ${missingMarked.length} marked container(s) outside window\u2026`)
         for (const id of missingMarked) {
           try {
             const chat = await fetchChatById(msal, id)
             if (chat) kept.push(chat)
           } catch (err) {
-            // Fail soft — a single marked chat failing should not abort the load.
             console.warn(
-              "[m365-pull] Skipping marked chat (fetch failed):",
+              "[m365-pull] Skipping marked container (fetch failed):",
               id,
               (err as Error).message,
             )
@@ -1739,24 +1412,22 @@ async function initialLoadChats(): Promise<void> {
     kept.sort((a, b) => chatActivityDate(b) - chatActivityDate(a))
 
     chatsState = { chats: kept }
-    rerenderChatList()
+    rerenderContainerList()
     saveCachedChats(userKey, kept)
     showChatsRefreshButton()
-    setStatus(`${kept.length} chats (${rangeStr}).`)
+    setStatus(`${kept.length} containers (${rangeStr}).`)
   } catch (err) {
-    // Partial recovery: save and show however many chats were kept before
-    // the failure so progress isn't lost.
     if (kept.length > 0) {
       chatsState = { chats: kept }
-      rerenderChatList()
+      rerenderContainerList()
       saveCachedChats(userKey, kept)
     }
     setStatus(
       `Load failed: ${(err as Error).message}${
         cached
-          ? " — showing cached."
+          ? " \u2014 showing cached."
           : kept.length > 0
-            ? ` — showing ${kept.length} partially loaded chats.`
+            ? ` \u2014 showing ${kept.length} partially loaded containers.`
             : ""
       }`,
       "error",
@@ -1765,246 +1436,79 @@ async function initialLoadChats(): Promise<void> {
     loadBtn.disabled = false
     refreshBtn.disabled = false
   }
+
+  // After chats load, start background recordings scan using the same window.
+  if (chatsState.chats.length > 0) {
+    const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
+    const { cutoffMs: fromMs, untilMs: toMs } = computeChatWindow(range2, chatPrefs)
+    void backgroundLoadRecordings(fromMs, toMs)
+  }
 }
 
 async function refreshChats(): Promise<void> {
   clearCachedChats(userCacheKey())
   chatsState = { chats: [] }
   el<HTMLUListElement>("chats").innerHTML = ""
+  // Reset recordings state; initialLoadChats will re-kick the scan.
+  recordingsState = { containers: [], chatsScanned: 0, truncated: false }
+  recordingsMap = new Map()
+  recordingsPending = false
+  recordingsScanFinished = false
   await initialLoadChats()
 }
 
-// ----- Meetings rendering -----
+// ----- Background recordings scan -----
 
-function rerenderRecordingsList(): void {
-  const list = el<HTMLUListElement>("recordings")
-  const filtered = applyRecordingFiltersAndSort(recordingsState.containers)
-  if (recordingsState.containers.length === 0) {
-    list.innerHTML = `<li class="empty">No recordings found in this window. Try widening the window.</li>`
-  } else if (filtered.length === 0) {
-    list.innerHTML = `<li class="empty">No recording containers match these filters. ${
-      recordingFilterState.markedOnly
-        ? "Star some containers to add them here."
-        : "Loosen the filters."
-    }</li>`
-  } else {
-    list.innerHTML = filtered.map(renderRecordingContainerRow).join("")
-    list.querySelectorAll<HTMLButtonElement>(".chat-action").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const chatId = btn.dataset.recContainerId!
-        void downloadContainerTranscripts(chatId, btn)
-      })
-    })
-    list.querySelectorAll<HTMLButtonElement>(".mark-toggle").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const chatId = btn.dataset.recContainerId
-        if (chatId) toggleMark(`rec:${chatId}`)
-      })
-    })
-  }
-  updateFiltersVisibility()
-  updateChatTypeChips()
-  if (currentSource === "teams.recordings") {
-    updateRecordingsSummary()
-  }
-  updateBulkButtons()
-}
-
-/** Mirror of updateTypeCountChips for the recording kind chips (1:1 / Group / Meeting). */
-function updateChatTypeChips(): void {
-  const counts = new Map<string, number>()
-  for (const c of recordingsState.containers) {
-    counts.set(c.chatType, (counts.get(c.chatType) || 0) + 1)
-  }
-  const chips = document.getElementById("kind-chips")
-  if (!chips) return
-  chips
-    .querySelectorAll<HTMLButtonElement>(".chip[data-kind]")
-    .forEach((chip) => {
-      const k = chip.dataset.kind!
-      const n = counts.get(k) ?? 0
-      const span = chip.querySelector<HTMLSpanElement>(".chip-count")
-      if (span) span.textContent = String(n)
-    })
-}
-
-/** Compute marked subsets for each loaded source and update bulk-action buttons. */
-function updateBulkButtons(): void {
-  const markedChats = chatsState.chats.filter((c) => markedIds.has(c.id))
-  const markedContainers = recordingsState.containers.filter((c) =>
-    markedIds.has(`rec:${c.chatId}`),
-  )
-  const chatBtn = document.getElementById("bulk-chats") as HTMLButtonElement | null
-  const meetingBtn = document.getElementById("bulk-recordings") as HTMLButtonElement | null
-  if (chatBtn) {
-    if (markedChats.length > 0) {
-      chatBtn.hidden = false
-      chatBtn.textContent = `Download ${markedChats.length} marked`
-    } else {
-      chatBtn.hidden = true
-    }
-  }
-  if (meetingBtn) {
-    if (markedContainers.length > 0) {
-      meetingBtn.hidden = false
-      meetingBtn.textContent = `Sync ${markedContainers.length} marked`
-    } else {
-      meetingBtn.hidden = true
-    }
-  }
-}
-
-/** Render a container row. Mark key is "rec:{chatId}" -- distinct from chat marks
- * (bare chatId) so the two keyspaces never collide in the shared markedIds set. */
-function renderRecordingContainerRow(c: RecordingContainer): string {
-  const markId = `rec:${c.chatId}`
-  const isMarked = markedIds.has(markId)
-  const title = c.chatTopic?.trim() || "(unnamed chat)"
-  const kindLabel =
-    c.chatType === "oneOnOne" ? "1:1" : c.chatType === "group" ? "Group" : "Meeting"
-
-  // Last downloaded: most recent recording sync across the container
-  let lastSyncMs: number | null = null
-  for (const r of c.recordings) {
-    const t = recordingPrefs[r.id]?.lastSync
-      ? Date.parse(recordingPrefs[r.id].lastSync!)
-      : null
-    if (t !== null && (lastSyncMs === null || t > lastSyncMs)) lastSyncMs = t
-  }
-  const downloadedTag =
-    lastSyncMs !== null
-      ? ` · downloaded ${formatDateShort(new Date(lastSyncMs))}`
-      : ""
-
-  const n = c.recordings.length
-  let dateTag = ""
-  if (n === 1) {
-    dateTag = ` · ${formatDateShort(new Date(c.recordings[0].eventCreatedDateTime))}`
-  } else if (n > 1) {
-    const latestStr = formatDateShort(new Date(c.recordings[0].eventCreatedDateTime))
-    const earliestStr = formatDateShort(new Date(c.recordings[n - 1].eventCreatedDateTime))
-    dateTag = earliestStr === latestStr ? ` · ${latestStr}` : ` · ${earliestStr} – ${latestStr}`
-  }
-  const sub = `${kindLabel} · ${n} recording${n !== 1 ? "s" : ""} in range${dateTag}${downloadedTag}`
-
-  // Truncation badge: visible warning when the message scan hit the per-chat cap
-  const truncBadge = c.truncated
-    ? ` <span class="truncated-badge" title="Message scan hit the per-chat cap — narrow the window for complete results">⚠ scan limit</span>`
-    : ""
-
-  return `
-    <li class="chat-row${isMarked ? " marked" : ""}">
-      <button class="mark-toggle${isMarked ? " marked" : ""}" data-rec-container-id="${escapeHtml(c.chatId)}" title="${isMarked ? "Unmark" : "Mark"} this container" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "★" : "☆"}</button>
-      <div class="chat-info">
-        <div class="chat-name">${escapeHtml(title)}${truncBadge}</div>
-        <div class="chat-sub">${escapeHtml(sub)}</div>
-      </div>
-      <button class="chat-action" data-rec-container-id="${escapeHtml(c.chatId)}">Sync transcripts</button>
-    </li>
-  `
-}
-function updateRecordingsSummary(): void {
-  const n = recordingsState.containers.length
-  const filtered = applyRecordingFiltersAndSort(recordingsState.containers).length
-  const marked = recordingsState.containers.filter((c) =>
-    markedIds.has(`rec:${c.chatId}`),
-  ).length
-  const totalRecs = recordingsState.containers.reduce(
-    (sum, c) => sum + c.recordings.length,
-    0,
-  )
-  const { chatsScanned, truncated } = recordingsState
-  const label = rangeLabel(userPrefs.recordingRange ?? { kind: "last-7d" })
-  if (n === 0) {
-    setStatus(`No recordings for ${label}. Widen the window.`)
-  } else if (filtered < n) {
-    setStatus(
-      `Showing ${filtered} of ${n} container(s) · ${totalRecs} recording(s) · ${marked} marked · ${chatsScanned} chat(s) scanned${truncated ? " · (chat list truncated — narrow window)" : ""}`,
-    )
-  } else {
-    setStatus(
-      `${n} container(s) · ${totalRecs} recording(s) (${label}) · ${marked} marked · ${chatsScanned} chat(s) scanned${truncated ? " · (chat list truncated — narrow window)" : ""}`,
-    )
-  }
-}
-function showRecordingsRefreshButton(): void {
-  el<HTMLButtonElement>("load-recordings").hidden = true
-  el<HTMLButtonElement>("refresh-recordings").hidden = false
-}
-
-// ----- Recordings loading -----
-
-async function initialLoadRecordings(): Promise<void> {
-  const loadBtn = el<HTMLButtonElement>("load-recordings")
-  loadBtn.disabled = true
-  loadBtn.textContent = "Loading\u2026"
+/** Scan recordings using the unified chat window. Runs in the background after
+ * chats load; does NOT block the container list. Renders rows with a pending
+ * indicator while scanning, then updates counts when the scan lands. */
+async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<void> {
+  recordingsPending = true
+  recordingsMap = new Map()
+  rerenderContainerList()
   try {
-    const range: RecordingRange = userPrefs.recordingRange ?? { kind: "last-7d" }
-    const { fromMs, toMs } = computeRecordingWindow(range)
     const result = await listRecordings(msal, {
       fromMs,
       toMs,
-      onProgress: (note) => setStatus(note),
+      onProgress: (note) => setScanStatus(`\uD83C\uDF99 ${note}`),
     })
-
-    let containers = result.containers
-
-    // Marked-include enrichment: always show rec:-marked containers even when
-    // their chat fell outside the scan window (0 in-window recordings is fine).
-    const recMarkedIncludeOn = userPrefs.recordingMarkedInclude !== false // default ON
-    if (recMarkedIncludeOn) {
-      const scannedIds = new Set(containers.map((c) => c.chatId))
-      const missingMarked = [...markedIds]
-        .filter((id) => id.startsWith("rec:"))
-        .map((id) => id.slice(4)) // strip "rec:" prefix
-        .filter((chatId) => !scannedIds.has(chatId))
-
-      if (missingMarked.length > 0) {
-        setStatus(`Fetching ${missingMarked.length} marked container(s) outside window\u2026`)
-        for (const chatId of missingMarked) {
-          try {
-            const chat = await fetchChatById(msal, chatId)
-            if (chat) {
-              containers = [
-                ...containers,
-                {
-                  chatId: chat.id,
-                  chatTopic: chat.topic ?? null,
-                  chatType: chat.chatType as ChatType,
-                  recordings: [],
-                  truncated: false,
-                },
-              ]
-            }
-          } catch (err) {
-            console.warn(
-              "[m365-pull] Skipping marked container (fetch failed):",
-              chatId,
-              (err as Error).message,
-            )
-          }
-        }
-      }
-    }
-
-    recordingsState.containers = containers
+    recordingsState.containers = result.containers
     recordingsState.chatsScanned = result.chatsScanned
     recordingsState.truncated = result.truncated
-    rerenderRecordingsList()
-    showRecordingsRefreshButton()
+    recordingsMap = new Map(result.containers.map((c) => [c.chatId, c]))
+    const recTotal = result.containers.reduce((s, c) => s + c.recordings.length, 0)
+    const withRecs = result.containers.filter((c) => c.recordings.length > 0).length
+    const rangeStr = chatRangeLabel(userPrefs.chatRange ?? { kind: "last-7d" }, chatPrefs)
+    setStatus(
+      `${chatsState.chats.length} containers (${rangeStr}) \u00b7 ${recTotal} recording(s) across ${withRecs} container(s)${result.truncated ? " \u00b7 (chat list truncated \u2014 narrow window)" : ""}.`,
+    )
   } catch (err) {
-    setStatus(`Failed to load recordings: ${(err as Error).message}`, "error")
+    console.warn("[m365-pull] Recordings scan failed:", err)
+    setStatus(`Recordings scan failed: ${(err as Error).message}`, "error")
   } finally {
-    loadBtn.disabled = false
-    loadBtn.textContent = "Load my recordings"
+    recordingsPending = false
+    recordingsScanFinished = true
+    rerenderContainerList()
+    setScanStatus("") // clear progress; row indicators show per-row state
   }
 }
 
-async function refreshRecordings(): Promise<void> {
-  recordingsState = { containers: [], chatsScanned: 0, truncated: false }
-  el<HTMLUListElement>("recordings").innerHTML = ""
-  await initialLoadRecordings()
+// ----- Bulk buttons -----
+
+/** Compute marked containers and update the bulk-sync button. */
+function updateBulkButtons(): void {
+  const markedContainers = chatsState.chats.filter((c) => markedIds.has(c.id))
+  const containerBtn = document.getElementById("bulk-containers") as HTMLButtonElement | null
+  if (containerBtn) {
+    if (markedContainers.length > 0) {
+      containerBtn.hidden = false
+      containerBtn.textContent = `Download kept`
+    } else {
+      containerBtn.hidden = true
+    }
+  }
 }
+
 // ----- Downloading a chat -----
 
 async function downloadChat(
@@ -2036,16 +1540,16 @@ async function downloadChat(
     sinceLabel = `since ${formatDateShort(since)}`
   }
 
-  setStatus(`Fetching "${chatName}" ${sinceLabel}…`)
+  setStatus(`Fetching "${chatName}" ${sinceLabel}\u2026`)
   button.disabled = true
   const originalLabel = button.textContent
-  button.textContent = "Fetching…"
+  button.textContent = "Fetching\u2026"
   try {
     const opts: Parameters<typeof fetchChatMessages>[2] = {
       onProgress: ({ count, oldestSeen }) => {
-        const back = oldestSeen ? `back to ${formatDateShort(oldestSeen)}` : "scanning…"
-        setStatus(`Fetching "${chatName}" ${sinceLabel} · ${count} messages, ${back}`)
-        button.textContent = `Fetching… (${count})`
+        const back = oldestSeen ? `back to ${formatDateShort(oldestSeen)}` : "scanning\u2026"
+        setStatus(`Fetching "${chatName}" ${sinceLabel} \u00b7 ${count} messages, ${back}`)
+        button.textContent = `Fetching\u2026 (${count})`
       },
     }
     if (since) opts.since = since
@@ -2073,10 +1577,10 @@ async function downloadChat(
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
     if (destination === "onedrive") {
       const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${onedriveName}`
-      setStatus(`${messages.length} messages fetched. Saving to OneDrive (${userPrefs.oneDriveFolder})…`)
+      setStatus(`${messages.length} messages fetched. Saving to OneDrive (${userPrefs.oneDriveFolder})\u2026`)
       result = await saveTextToOneDrive(msal, fullPath, markdownBody, "text/markdown")
     } else {
-      setStatus(`${messages.length} messages fetched. Saving…`)
+      setStatus(`${messages.length} messages fetched. Saving\u2026`)
       result = await saveAsText(browserName, markdownBody, {
         extension: ".md",
         description: "Markdown",
@@ -2094,18 +1598,17 @@ async function downloadChat(
       }
       saveChatPrefs(userCacheKey(), chatPrefs)
       scheduleOneDriveSave()
-      rerenderChatList()
+      rerenderContainerList()
       const incrementalNote = usingIncremental ? " (incremental)" : ""
       if (destination === "onedrive") {
-        // Folder now exists (or still does) — refresh the "↗ Open" link.
         void refreshOneDriveFolderLink()
         const where = result.path ? `OneDrive (${result.path})` : "OneDrive"
         setStatus(
-          `✓ Saved ${messages.length} messages from "${chatName}" to ${where}${incrementalNote}.`,
+          `\u2713 Saved ${messages.length} messages from "${chatName}" to ${where}${incrementalNote}.`,
         )
       } else {
         setStatus(
-          `✓ Saved ${messages.length} messages from "${chatName}"${incrementalNote}.`,
+          `\u2713 Saved ${messages.length} messages from "${chatName}"${incrementalNote}.`,
         )
       }
       return true
@@ -2114,7 +1617,7 @@ async function downloadChat(
       return false
     } else if (result.reason === "unsupported") {
       setStatus(
-        "Browser save not supported here — use Microsoft Edge or another Chromium-based browser.",
+        "Browser save not supported here \u2014 use Microsoft Edge or another Chromium-based browser.",
         "error",
       )
       return false
@@ -2133,7 +1636,7 @@ async function downloadChat(
 
 // ----- Downloading recording transcripts -----
 
-/** Outcome of a single transcript download. "cross-tenant" is NOT a failure —
+/** Outcome of a single transcript download. "cross-tenant" is NOT a failure \u2014
  * the recording lives in another org's SharePoint and isn't accessible via this
  * account; callers count it separately from real failures. */
 type TranscriptOutcome = "ok" | "fail" | "cross-tenant"
@@ -2154,12 +1657,12 @@ async function downloadRecordingTranscript(
   }
   const originalLabel = button.textContent
   button.disabled = true
-  button.textContent = "Resolving…"
+  button.textContent = "Resolving\u2026"
   const subject = recording.chatTopic?.trim() || recording.filename
   try {
     const resolved = await resolveRecordingFromUrl(msal, recording.url)
-    button.textContent = "Fetching transcripts…"
-    setStatus(`Fetching transcripts for "${subject}"…`)
+    button.textContent = "Fetching transcripts\u2026"
+    setStatus(`Fetching transcripts for "${subject}"\u2026`)
     const payload = await fetchRecordingTranscripts(msal, resolved, {
       onProgress: ({ stage, count, total }) => {
         const counter =
@@ -2175,16 +1678,13 @@ async function downloadRecordingTranscript(
       )
       return "fail"
     }
-    button.textContent = "Saving…"
+    button.textContent = "Saving\u2026"
     const account = msal.getActiveAccount()
     const userOid = account?.localAccountId ?? null
     const filename = buildTranscriptFilename(recording, userOid, ".md")
     const destination = userPrefs.destination
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
 
-    // Concat all VTT bodies (some recordings carry multiple transcripts) into
-    // one combined markdown document. Single-transcript case is the common
-    // path; the concat produces the same output as a direct vttToMarkdown call.
     const combinedVtt = payload.transcripts
       .map((t) => t.content)
       .join("\n\n")
@@ -2244,12 +1744,12 @@ async function downloadRecordingTranscript(
       }
       saveRecordingPrefs(userCacheKey(), recordingPrefs)
       scheduleOneDriveSave()
-      rerenderRecordingsList()
+      rerenderContainerList()
       if (destination === "onedrive") {
         const where = result.path ? `OneDrive (${result.path})` : "OneDrive"
-        setStatus(`✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}" to ${where}.`)
+        setStatus(`\u2713 Saved ${payload.transcriptCount} transcript(s) for "${subject}" to ${where}.`)
       } else {
-        setStatus(`✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}".`)
+        setStatus(`\u2713 Saved ${payload.transcriptCount} transcript(s) for "${subject}".`)
       }
       return "ok"
     } else if (result.reason === "cancelled") {
@@ -2260,12 +1760,11 @@ async function downloadRecordingTranscript(
       return "fail"
     }
   } catch (err) {
-    // Cross-tenant recording: not a real failure — the .mp4 lives in another
-    // org's SharePoint and isn't reachable via this account. Label distinctly
-    // and let callers count it separately from genuine failures.
+    // Cross-tenant recording: not a real failure \u2014 the .mp4 lives in another
+    // org's SharePoint and isn't reachable via this account.
     if ((err as { crossTenant?: boolean }).crossTenant) {
       setStatus(
-        `⊗ "${subject}" — cross-tenant: transcript stored in another org, not available.`,
+        `\u2297 "${subject}" \u2014 from another organization \u2014 Microsoft won't let you download it.`,
       )
       return "cross-tenant"
     }
@@ -2278,42 +1777,13 @@ async function downloadRecordingTranscript(
   }
 }
 
-// ----- Bulk download (all marked items in current source) -----
-
-async function bulkDownloadChats(): Promise<void> {
-  const marked = chatsState.chats.filter((c) => markedIds.has(c.id))
-  if (marked.length === 0) return
-  const bulkBtn = el<HTMLButtonElement>("bulk-chats")
-  const originalLabel = bulkBtn.textContent
-  bulkBtn.disabled = true
-  let ok = 0
-  let fail = 0
-  for (let i = 0; i < marked.length; i++) {
-    const chat = marked[i]
-    bulkBtn.textContent = `Downloading ${i + 1}/${marked.length}\u2026`
-    const rowBtn =
-      (document.querySelector(
-        `.chat-action[data-chat-id="${CSS.escape(chat.id)}"]`,
-      ) as HTMLButtonElement | null) ?? document.createElement("button")
-    const success = await downloadChat(chat.id, chatDisplayName(chat), rowBtn)
-    if (success) ok++
-    else fail++
-  }
-  bulkBtn.disabled = false
-  bulkBtn.textContent = originalLabel || ""
-  setStatus(
-    `Bulk chats complete: ${ok} succeeded${fail > 0 ? `, ${fail} failed` : ""}.`,
-  )
-  updateBulkButtons()
-}
-
-/** Sync all recordings in a container row. Loops downloadRecordingTranscript
- * over each recording in the container; reuses the existing pipeline untouched. */
+/** Sync all recordings in a container row. */
 async function downloadContainerTranscripts(
   chatId: string,
   button: HTMLButtonElement,
 ): Promise<void> {
-  const container = recordingsState.containers.find((c) => c.chatId === chatId)
+  const container = recordingsMap.get(chatId)
+    ?? recordingsState.containers.find((c) => c.chatId === chatId)
   if (!container) {
     setStatus("Container not found in current list. Refresh and try again.", "error")
     return
@@ -2329,7 +1799,7 @@ async function downloadContainerTranscripts(
   let crossTenant = 0
   for (let i = 0; i < container.recordings.length; i++) {
     const rec = container.recordings[i]
-    button.textContent = `Syncing ${i + 1}/${container.recordings.length}\u2026`
+    button.textContent = `Downloading ${i + 1}/${container.recordings.length}\u2026`
     const tempBtn = document.createElement("button")
     const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
     if (outcome === "ok") ok++
@@ -2337,41 +1807,77 @@ async function downloadContainerTranscripts(
     else fail++
   }
   button.disabled = false
-  button.textContent = originalLabel || "Sync transcripts"
+  button.textContent = originalLabel || "Download"
   setStatus(
-    `Container sync complete: ${ok} transcript(s) saved${crossTenant > 0 ? `, ${crossTenant} cross-tenant (unavailable)` : ""}${fail > 0 ? `, ${fail} failed` : ""}.`,
+    `Download complete \u2014 saved ${ok} transcript${ok !== 1 ? "s" : ""}${crossTenant > 0 ? `, ${crossTenant} from another organization (unavailable)` : ""}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
   )
 }
 
-async function bulkDownloadRecordings(): Promise<void> {
-  const markedContainers = recordingsState.containers.filter((c) =>
-    markedIds.has(`rec:${c.chatId}`),
-  )
-  if (markedContainers.length === 0) return
-  const bulkBtn = el<HTMLButtonElement>("bulk-recordings")
+// ----- Unified container sync -----
+
+/** Sync a single container: messages and/or transcripts depending on the
+ * global include-messages / include-recordings toggles. Files stay separate. */
+async function syncContainer(
+  chatId: string,
+  chatName: string,
+  button: HTMLButtonElement,
+): Promise<boolean> {
+  const includeMessages = userPrefs.includeMessages !== false // default ON
+  const includeRecordings = userPrefs.includeRecordings !== false // default ON
+
+  if (!includeMessages && !includeRecordings) {
+    setStatus("No artifact type selected \u2014 enable Include: Messages and/or Include: Transcripts.", "error")
+    return false
+  }
+
+  let anyOk = false
+
+  if (includeMessages) {
+    const ok = await downloadChat(chatId, chatName, button)
+    if (ok) anyOk = true
+  }
+
+  if (includeRecordings) {
+    const container = recordingsMap.get(chatId)
+      ?? recordingsState.containers.find((c) => c.chatId === chatId)
+    if (container && container.recordings.length > 0) {
+      await downloadContainerTranscripts(chatId, button)
+      anyOk = true
+    }
+  }
+
+  return anyOk
+}
+
+// ----- Bulk sync (all marked containers) -----
+
+async function bulkSyncContainers(): Promise<void> {
+  const marked = chatsState.chats.filter((c) => markedIds.has(c.id))
+  if (marked.length === 0) return
+  const bulkBtn = el<HTMLButtonElement>("bulk-containers")
   const originalLabel = bulkBtn.textContent
   bulkBtn.disabled = true
   let ok = 0
   let fail = 0
-  let crossTenant = 0
-  for (let i = 0; i < markedContainers.length; i++) {
-    const container = markedContainers[i]
-    bulkBtn.textContent = `Syncing container ${i + 1}/${markedContainers.length}\u2026`
-    for (const rec of container.recordings) {
-      const tempBtn = document.createElement("button")
-      const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
-      if (outcome === "ok") ok++
-      else if (outcome === "cross-tenant") crossTenant++
-      else fail++
-    }
+  for (let i = 0; i < marked.length; i++) {
+    const chat = marked[i]
+    bulkBtn.textContent = `Downloading ${i + 1}/${marked.length}\u2026`
+    const rowBtn =
+      (document.querySelector(
+        `.container-action[data-chat-id="${CSS.escape(chat.id)}"]`,
+      ) as HTMLButtonElement | null) ?? document.createElement("button")
+    const success = await syncContainer(chat.id, chatDisplayName(chat), rowBtn)
+    if (success) ok++
+    else fail++
   }
   bulkBtn.disabled = false
   bulkBtn.textContent = originalLabel || ""
   setStatus(
-    `Bulk sync complete: ${ok} recording(s) succeeded${crossTenant > 0 ? `, ${crossTenant} cross-tenant (unavailable)` : ""}${fail > 0 ? `, ${fail} failed` : ""}.`,
+    `Download complete \u2014 saved ${ok}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
   )
   updateBulkButtons()
 }
+
 // ----- Settings modal -----
 
 function openSettingsModal(): void {
@@ -2379,7 +1885,6 @@ function openSettingsModal(): void {
   el<HTMLInputElement>("settings-folder").value = userPrefs.oneDriveFolder
   el<HTMLSelectElement>("settings-destination").value = userPrefs.destination
   modal.hidden = false
-  // Focus the folder field for instant typing
   setTimeout(() => el<HTMLInputElement>("settings-folder").focus(), 50)
 }
 
@@ -2396,8 +1901,6 @@ function saveSettingsModal(): void {
     setStatus("Settings: folder path cannot be empty.", "error")
     return
   }
-  // Normalize: convert backslashes to forward slashes, ensure leading slash,
-  // strip trailing slash
   const normalized =
     (rawFolder.startsWith("/") ? rawFolder : "/" + rawFolder)
       .replace(/\\+/g, "/")

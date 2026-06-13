@@ -29,6 +29,8 @@ export function loadUserPrefs(userKey: string): UserPrefs {
       ...(data.markedInclude !== undefined ? { markedInclude: data.markedInclude } : {}),
       ...(data.hideDownloaded !== undefined ? { hideDownloaded: data.hideDownloaded } : {}),
       ...(data.recordingMarkedInclude !== undefined ? { recordingMarkedInclude: data.recordingMarkedInclude } : {}),
+      ...(data.includeMessages !== undefined ? { includeMessages: data.includeMessages } : {}),
+      ...(data.includeRecordings !== undefined ? { includeRecordings: data.includeRecordings } : {}),
     }
   } catch {
     return { ...DEFAULTS }
