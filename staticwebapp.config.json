@@ -3,6 +3,16 @@
     "rewrite": "/index.html",
     "exclude": ["/assets/*", "*.{css,js,png,svg,ico,json,woff,woff2}"]
   },
+  "routes": [
+    { "route": "/.auth/*", "allowedRoles": ["anonymous", "authenticated"] },
+    { "route": "/*", "allowedRoles": ["authenticated"] }
+  ],
+  "responseOverrides": {
+    "401": {
+      "statusCode": 302,
+      "redirect": "/.auth/login/aad?post_login_redirect_uri=/"
+    }
+  },
   "globalHeaders": {
     "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://login.microsoftonline.com https://graph.microsoft.com https://*.sharepoint.com; frame-src https://login.microsoftonline.com; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
     "X-Content-Type-Options": "nosniff",
