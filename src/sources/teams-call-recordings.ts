@@ -17,7 +17,7 @@
 // (Graph /shares -> driveItem -> _api/v2.1 with media/transcripts expansion).
 
 import type { PublicClientApplication } from "@azure/msal-browser"
-import { sanitizeFilenameName, formatPulledStamp, formatDateStamp } from "./filename-format"
+import { sanitizeFilenameName, formatPulledStamp, formatDateTimeStamp, shortHash } from "./filename-format"
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const SCOPES = ["Chat.Read"]
@@ -508,32 +508,39 @@ export async function listRecordings(
 /** Build a versioned, sort-by-name-friendly filename for a recording's
  * transcript (Phase 3). Format:
  *
- *   <Name>__rec-<callYYYY-MM-DD>__pulled-<YYYY-MM-DD-HHMM>.transcript.<ext>
+ *   <Name>__rec-<callYYYY-MM-DD-HHMM>-<token>__pulled-<YYYY-MM-DD-HHMM>.transcript.<ext>
  *
- * - <Name>          = sanitized subject (keeps human-readable spaces)
- * - rec-<callDate>   = the call's own immutable date (its identity)
- * - pulled-<...>      = when THIS transcript was downloaded (primary version key)
+ * - <Name>            = sanitized subject (keeps human-readable spaces)
+ * - rec-<callDateTime> = the call's own start date+TIME (its identity, sortable)
+ * - <token>            = short stable hash of the recording's unique id
+ *                        (callId::filename) — a collision-proof fail-safe
+ * - pulled-<...>        = when THIS transcript was downloaded (version key)
  *
- * Because rec-<callDate> is fixed per call and pulled-<...> changes per download,
- * the recurring weekly occurrences of a meeting each get a distinct rec- date,
- * and re-pulls of the same call get distinct pulled- stamps — so sort-by-name
- * groups a chat's recordings by call date and, within a call, by pull time.
+ * The call stamp carries TIME (not just date) so two recordings on the SAME chat
+ * + SAME day — e.g. a call that disconnected and reconnected — get distinct names
+ * ordered by when each call actually started. The <token> is the fail-safe: even
+ * two recordings that somehow share the same call minute can't collide, because
+ * it's derived from the recording's guaranteed-unique id. So sort-by-name groups
+ * a chat's recordings by call time, then token (stable tiebreak), then pull time.
  *
  * The subject is derived from (in order):
  *   1. chat topic, when set (scheduled meetings, named group chats)
  *   2. "with <other person>" for 1:1 chats (skips self by oid)
  *   3. the raw recording filename, stripped of its Teams-injected suffix/ext
  *
- * Examples:
- *   Marc Catch-Up__rec-2026-05-26__pulled-2026-06-17-1250.transcript.md
- *   with Diego Colombo__rec-2026-05-26__pulled-2026-06-17-1250.transcript.md
+ * Examples (two DIFFERENT recordings, same chat, same day):
+ *   Marc Catch-Up__rec-2026-05-26-0931-3k1m9p__pulled-2026-06-17-1250.transcript.md
+ *   Marc Catch-Up__rec-2026-05-26-0958-x82af0__pulled-2026-06-17-1250.transcript.md
  */
 export function buildTranscriptFilename(
   r: RecordingItem,
   userOid: string | null,
   extension: string,
 ): string {
-  const callDate = formatDateStamp(new Date(r.eventCreatedDateTime))
+  // Date+time of the call (distinguishes same-day recordings) + a stable hash of
+  // the recording's unique id (fail-safe against same-minute collisions).
+  const callStamp = formatDateTimeStamp(new Date(r.eventCreatedDateTime))
+  const token = shortHash(r.id)
   const pulled = formatPulledStamp(new Date())
 
   let subject = ""
@@ -561,7 +568,7 @@ export function buildTranscriptFilename(
   const name = sanitizeFilenameName(subject)
   const ext = extension.startsWith(".") ? extension : `.${extension}`
 
-  return `${name}__rec-${callDate}__pulled-${pulled}.transcript${ext}`
+  return `${name}__rec-${callStamp}-${token}__pulled-${pulled}.transcript${ext}`
 }
 
 /** Parse ISO 8601 duration to seconds (best-effort, handles PT?H?M?S). */

@@ -46,7 +46,9 @@ showing recording state before scanning; it's gone.
 - **Phase 3** (versioned filenames): dated + ranged names so **sort-by-name reveals download
   history**.
   - chat: `<Name>__chat__pulled-<YYYY-MM-DD-HHMM>__<rangeStart>_to_<rangeEnd>.txt`
-  - recording: `<Name>__rec-<callDate>__pulled-<YYYY-MM-DD-HHMM>.transcript.txt`
+  - recording: `<Name>__rec-<callYYYY-MM-DD-HHMM>-<token>__pulled-<YYYY-MM-DD-HHMM>.transcript.txt`
+    (call stamp carries TIME so same-day recordings differ; `<token>` = short stable hash of the
+    recording's unique id = collision-proof fail-safe)
   - sanitize Windows-prohibited chars in `<Name>`; pulled-date is the primary version key.
 
 ## Parked (with reason)
