@@ -203,6 +203,34 @@ const selectedArtifacts: Set<string> = new Set()
 /** Ephemeral expand state — NOT persisted across page reloads. */
 const expandedChatIds: Set<string> = new Set()
 
+// ----- Progressive-disclosure toolbar state (3-section toolbar, 2026-06-18) -----
+
+/** True once a load has completed at least once. Gates "reload on setting change"
+ * (replaces the old `!refreshchats.hidden` signal) and post-load section reveal. */
+let hasLoadedOnce = false
+/** Last recording-scan window, kept so the checklist's recordings Retry can re-run. */
+let lastRecordingWindow: { fromMs: number; toMs: number } | null = null
+
+// Build B: Include is a LOAD-SCOPE. The live §1 chips write userPrefs.includeMessages/
+// includeRecordings, but §1 collapses to a receipt after load, so the scope can only
+// change via the picker (pre-load, or Change→re-pick→Load). We CAPTURE the chip state
+// at load time into these module vars; render/filter/action logic reads THESE (not the
+// live chip state) so the listed experience always matches what the load actually pulled.
+// Defaults both-on so any pre-load render matches today's behavior.
+let loadIncludeMessages = true
+let loadIncludeRecordings = true
+
+type LoadStepState = "pending" | "running" | "done" | "error"
+interface LoadStep {
+  id: "signin" | "chats" | "recordings" | "done"
+  label: string
+  detail?: string
+  state: LoadStepState
+  error?: string
+}
+/** Live checklist model shown in §1 during a load. */
+let loadSteps: LoadStep[] = []
+
 // ----- Helpers -----
 
 function el<T extends HTMLElement>(id: string): T {
@@ -245,10 +273,15 @@ function formatIsoDuration(iso: string): string {
   return parts.join(" ")
 }
 
-/** All artifact IDs for a chat: "msg:{chatId}" + "rec:{rec.id}" for each confirmed recording. */
+/** Artifact IDs for a chat, SCOPED to the captured load-time Include scope:
+ * "msg:{chatId}" (only when Messages is in scope) + "rec:{rec.id}" for each
+ * confirmed recording (only when Recordings is in scope). Select-all, the global
+ * select-all count, and per-chat selection all read this, so a suppressed type
+ * is never selectable. */
 function getArtifactIds(chatId: string, recContainer: RecordingContainer | undefined): string[] {
-  const ids: string[] = [`msg:${chatId}`]
-  if (recContainer && recContainer.recordings.length > 0) {
+  const ids: string[] = []
+  if (loadIncludeMessages) ids.push(`msg:${chatId}`)
+  if (loadIncludeRecordings && recContainer && recContainer.recordings.length > 0) {
     recContainer.recordings.forEach((r) => ids.push(`rec:${r.id}`))
   }
   return ids
@@ -496,14 +529,9 @@ function syncUserPrefsToUI(): void {
   const chatRange: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
   const chatRangeEl = document.getElementById("chat-range") as HTMLSelectElement | null
   if (chatRangeEl) chatRangeEl.value = chatRange.kind
-  const chatCustomEl = document.getElementById("chat-custom-range-inputs") as HTMLSpanElement | null
-  if (chatCustomEl) chatCustomEl.hidden = chatRange.kind !== "custom"
-  if (chatRange.kind === "custom") {
-    const chatFromEl = document.getElementById("chat-from") as HTMLInputElement | null
-    const chatToEl = document.getElementById("chat-to") as HTMLInputElement | null
-    if (chatFromEl && chatRange.customFrom) chatFromEl.value = chatRange.customFrom
-    if (chatToEl && chatRange.customTo) chatToEl.value = chatRange.customTo
-  }
+  // Custom date inputs are render-when-custom (renderCustomRangeField reads the
+  // current selection + stored customFrom/To and (re)builds the inputs inline).
+  renderCustomRangeField()
 
   // Chat marked-include toggle (default ON: undefined \u2192 true)
   const markedIncludeBtn = document.getElementById("marked-include") as HTMLButtonElement | null
@@ -523,6 +551,13 @@ function syncUserPrefsToUI(): void {
   // Hide-downloaded toggle
   const hideBtn = document.getElementById("hide-downloaded") as HTMLButtonElement | null
   if (hideBtn) hideBtn.classList.toggle("active", !!userPrefs.hideDownloaded)
+
+  // Change 3: Grouped/Flat view toggle (default "flat" when unset)
+  const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+  const viewGroupedBtn = document.getElementById("view-grouped") as HTMLButtonElement | null
+  if (viewGroupedBtn) viewGroupedBtn.classList.toggle("active", viewMode === "grouped")
+  const viewFlatBtn = document.getElementById("view-flat") as HTMLButtonElement | null
+  if (viewFlatBtn) viewFlatBtn.classList.toggle("active", viewMode === "flat")
 }
 
 /** Populate the "\u2197 Open" link next to the OneDrive folder path. */
@@ -730,6 +765,14 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     }
     if (!filterState.enabledTypes.has(c.chatType)) return false
     if (filterState.markedOnly && !isChatFavorited(c.id)) return false
+    // Build B: Messages OFF => recordings-only. A chat with no recording has
+    // nothing to show in this scope, so filter it out. (Until the recording scan
+    // lands, no chat has a recording yet — but §2/§3 aren't revealed until the
+    // scan completes, so the user never sees the mid-scan empty list.)
+    if (!loadIncludeMessages) {
+      const rc = recordingsMap.get(c.id)
+      if (!rc || rc.recordings.length === 0) return false
+    }
     // hideDownloaded: hide containers where the chat archive has been downloaded
     if (userPrefs.hideDownloaded && chatPrefs[c.id]?.lastSync) return false
     if (q) {
@@ -857,72 +900,101 @@ function render(): void {
       </div>
     </div>
     <main>
-      <div class="actions actions-global">
-        <span class="label">to</span>
-        <select id="destination" title="Where to save downloads">
-          <option value="browser">Browser (save dialog)</option>
-          <option value="onedrive">OneDrive folder</option>
-        </select>
-        <span class="onedrive-folder" id="onedrive-folder" hidden>
-          <button class="link-button" id="edit-folder" title="Click to change">/m365-pull/teams-chats</button>
-          <a class="link-button" id="open-folder" target="_blank" rel="noopener" hidden title="Open this folder in OneDrive on the web">\u2197 Open</a>
-        </span>
-      </div>
-      <div class="actions" id="actions">
-        <button id="loadchats" class="primary">Load my Teams containers</button>
-        <button id="refreshchats" hidden>Refresh</button>
-        <span class="label">Show from:</span>
-        <select id="chat-range" title="Date range for container list">
-          <option value="this-week">This week</option>
-          <option value="last-7d" selected>Last 7 days</option>
-          <option value="last-30d">Last 30 days</option>
-          <option value="since-last-download">Since last download</option>
-          <option value="custom">Custom range\u2026</option>
-        </select>
-        <span id="chat-custom-range-inputs" class="custom-range" hidden>
-          <input type="date" id="chat-from" title="From (inclusive)" />
-          <span class="label">to</span>
-          <input type="date" id="chat-to" title="To (inclusive)" />
-        </span>
-        <button class="chip" id="marked-include" title="Always show favorited containers regardless of range">\u2605 Always include favorites</button>
-        <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
-        <span class="label">Download history:</span>
-        <select id="lookback" title="Download history per chat (messages)">
-          <option value="7">Last 7 days</option>
-          <option value="30" selected>Last 30 days</option>
-          <option value="90">Last 90 days</option>
-          <option value="all">All messages</option>
-          <option value="since-last-download">Since last download</option>
-        </select>
-        <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
-        <button class="chip active" id="include-messages" title="Include chat message archives when downloading a container">Include: Messages</button>
-        <button class="chip active" id="include-recordings" title="Include call transcripts when downloading a container">Include: Transcripts</button>
-        <button id="bulk-containers" class="bulk-action" hidden></button>
-        <button id="download-selected" class="bulk-action" hidden></button>
-      </div>
-      <div id="scan-status" class="scan-status"></div>
-
-      <div class="filters" id="filters" hidden>
-        <input id="search" type="search" placeholder="Search containers by name\u2026" />
-        <div class="chips" id="type-chips">
-          ${KNOWN_TYPES.map(
-            (t) =>
-              `<button class="chip active" data-type="${t.id}">${escapeHtml(t.label)} <span class="chip-count">0</span></button>`,
-          ).join("")}
+      <!-- \u00a71 \u2014 LOAD (only section visible before content loads) -->
+      <section class="toolbar-section" id="section-load">
+        <div class="section-head">Load</div>
+        <div class="section-body" id="load-picker">
+          <span class="field">
+            <span class="label">Show from:</span>
+            <select id="chat-range" title="Date range for chat list">
+              <option value="this-week">This week</option>
+              <option value="last-7d" selected>Last 7 days</option>
+              <option value="last-30d">Last 30 days</option>
+              <option value="since-last-download">Since last pull</option>
+              <option value="custom">Custom range\u2026</option>
+            </select>
+          </span>
+          <span class="field" id="chat-custom-range-field"></span>
+          <button class="chip" id="marked-include" title="Always show favorited chats regardless of range">\u2605 Always include favorites</button>
+          <span class="field">
+            <span class="label">Include:</span>
+            <button class="chip active" id="include-messages" title="Include chat message archives">Messages</button>
+            <button class="chip active" id="include-recordings" title="Include call recordings/transcripts">Recordings</button>
+          </span>
+          <button id="loadchats" class="primary">\u2b07 Load my Teams chats</button>
         </div>
-        <label class="sort-label">
-          Sort
-          <select id="sortby">
-            <option value="marked-first">Favorites first \u00b7 then recent</option>
-            <option value="recent">Most recent activity</option>
-            <option value="name">Name (A\u2013Z)</option>
-          </select>
-        </label>
-        <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
-        <button class="chip show-ignored" id="showignored">\u2298 Show ignored</button>
-        <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear all ignored</button>
-        <button class="chip" id="hide-downloaded">Hide downloaded</button>
-      </div>
+        <div class="section-body load-checklist" id="load-checklist" hidden></div>
+        <div class="section-body load-receipt" id="load-receipt" hidden></div>
+      </section>
+
+      <!-- \u00a72 \u2014 VIEW (revealed after load) -->
+      <section class="toolbar-section" id="section-view" hidden>
+        <div class="section-head">View</div>
+        <div class="section-body">
+          <input id="search" type="search" placeholder="Search chats by name\u2026" />
+          <div class="chips" id="type-chips">
+            ${KNOWN_TYPES.map(
+              (t) =>
+                `<button class="chip active" data-type="${t.id}">${escapeHtml(t.label)} <span class="chip-count">0</span></button>`,
+            ).join("")}
+          </div>
+          <span class="field">
+            <span class="label">Sort by:</span>
+            <select id="sortby">
+              <option value="marked-first">Favorites first \u00b7 then recent</option>
+              <option value="recent">Most recent activity</option>
+              <option value="name">Name (A\u2013Z)</option>
+            </select>
+          </span>
+          <span class="field">
+            <span class="label">View:</span>
+            <span class="view-toggle" role="group" aria-label="View mode">
+              <button class="seg" id="view-flat" data-view="flat" title="Flat \\u2014 every artifact (messages + each recording) as its own row">Flat</button>
+              <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \\u2014 chat rows that expand into their artifacts">Grouped</button>
+            </span>
+          </span>
+          <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
+          <button class="chip" id="hide-downloaded">Hide downloaded</button>
+          <button class="chip show-ignored" id="showignored" hidden>\u2298 Show ignored</button>
+        </div>
+      </section>
+
+      <!-- \u00a73 \u2014 DOWNLOAD & BULK ACTIONS (revealed with \u00a72) -->
+      <section class="toolbar-section" id="section-download" hidden>
+        <div class="section-head">Download &amp; bulk actions</div>
+        <div class="section-body">
+          <span class="field">
+            <span class="label">Destination:</span>
+            <select id="destination" title="Where to save downloads">
+              <option value="browser">Browser (save dialog)</option>
+              <option value="onedrive">OneDrive folder</option>
+            </select>
+            <span class="onedrive-folder" id="onedrive-folder" hidden>
+              <button class="link-button" id="edit-folder" title="Click to change">/m365-pull/teams-chats</button>
+              <a class="link-button" id="open-folder" target="_blank" rel="noopener" hidden title="Open this folder in OneDrive on the web">\u2197 Open</a>
+            </span>
+          </span>
+          <span class="field">
+            <span class="label">Download history:</span>
+            <select id="lookback" title="Download history per chat (messages)">
+              <option value="7">Last 7 days</option>
+              <option value="30" selected>Last 30 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="all">All messages</option>
+              <option value="since-last-download">Since last pull</option>
+            </select>
+          </span>
+          <label class="field select-all-field">
+            <input type="checkbox" id="select-all-global" />
+            <span class="label">Select all</span>
+          </label>
+          <button id="bulk-containers" class="bulk-action" hidden></button>
+          <button id="download-selected" class="bulk-action" hidden></button>
+          <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear ignored</button>
+        </div>
+      </section>
+
+      <div id="scan-status" class="scan-status"></div>
       <div id="status"></div>
       <ul id="chats" class="chat-list"></ul>
     </main>
@@ -940,12 +1012,24 @@ function wireGlobalHandlers(account: AccountInfo): void {
     void msal.logoutRedirect({ account })
   })
 
-  // Container load / refresh
+  // Container load (Reload now lives on the §1 receipt; Refresh button removed).
   el<HTMLButtonElement>("loadchats").addEventListener("click", () => {
     void initialLoadChats()
   })
-  el<HTMLButtonElement>("refreshchats").addEventListener("click", () => {
-    void refreshChats()
+
+  // §3 global "Select all" \u2014 select/clear every artifact across all loaded chats.
+  el<HTMLInputElement>("select-all-global").addEventListener("change", () => {
+    const cb = el<HTMLInputElement>("select-all-global")
+    if (cb.checked) {
+      for (const c of chatsState.chats) {
+        for (const id of getArtifactIds(c.id, recordingsMap.get(c.id))) {
+          selectedArtifacts.add(id)
+        }
+      }
+    } else {
+      selectedArtifacts.clear()
+    }
+    rerenderContainerList()
   })
 
   // Sync favorites button (pulls every favorited stream on click)
@@ -958,58 +1042,32 @@ function wireGlobalHandlers(account: AccountInfo): void {
     void downloadSelectedArtifacts()
   })
 
-  // Chat range dropdown + custom date inputs \u2014 persisted to OneDrive userPrefs
+  // Chat range dropdown \u2014 custom date inputs are RENDERED inline only when
+  // "Custom range\u2026" is selected (render-when-custom, not the hidden-attr trick).
   el<HTMLSelectElement>("chat-range").addEventListener("change", () => {
     const kind = el<HTMLSelectElement>("chat-range").value as ChatRange["kind"]
-    const chatCustomEl = el<HTMLSpanElement>("chat-custom-range-inputs")
-    chatCustomEl.hidden = kind !== "custom"
     if (kind === "custom") {
-      const fromEl = el<HTMLInputElement>("chat-from")
-      const toEl = el<HTMLInputElement>("chat-to")
-      if (!fromEl.value) fromEl.value = toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
-      if (!toEl.value) toEl.value = toLocalDateString(new Date())
-      userPrefs = { ...userPrefs, chatRange: {
-        kind,
-        customFrom: fromEl.value || undefined,
-        customTo: toEl.value || undefined,
-      } }
+      // Seed defaults if the stored range isn't already custom.
+      if (userPrefs.chatRange?.kind !== "custom") {
+        userPrefs = { ...userPrefs, chatRange: {
+          kind: "custom",
+          customFrom: toLocalDateString(new Date(Date.now() - 7 * DAY_MS)),
+          customTo: toLocalDateString(new Date()),
+        } }
+      }
     } else {
       userPrefs = { ...userPrefs, chatRange: { kind } }
     }
     saveUserPrefs(userCacheKey(), userPrefs)
     scheduleOneDriveSave()
-    // If chats are already loaded, clear and reload with the new range.
-    if (!el<HTMLButtonElement>("refreshchats").hidden) {
-      clearCachedChats(userCacheKey())
-      chatsState = { chats: [] }
-      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
-      recordingsMap = new Map()
-      el<HTMLUListElement>("chats").innerHTML = ""
-      void initialLoadChats()
-    }
+    renderCustomRangeField()
+    reloadChatsWithCurrentSettings()
   })
 
-  const applyCustomChatRange = () => {
-    const fromEl = document.getElementById("chat-from") as HTMLInputElement | null
-    const toEl = document.getElementById("chat-to") as HTMLInputElement | null
-    userPrefs = { ...userPrefs, chatRange: {
-      kind: "custom",
-      customFrom: fromEl?.value || undefined,
-      customTo: toEl?.value || undefined,
-    } }
-    saveUserPrefs(userCacheKey(), userPrefs)
-    scheduleOneDriveSave()
-    if (!el<HTMLButtonElement>("refreshchats").hidden) {
-      clearCachedChats(userCacheKey())
-      chatsState = { chats: [] }
-      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
-      recordingsMap = new Map()
-      el<HTMLUListElement>("chats").innerHTML = ""
-      void initialLoadChats()
-    }
-  }
-  el<HTMLInputElement>("chat-from").addEventListener("change", applyCustomChatRange)
-  el<HTMLInputElement>("chat-to").addEventListener("change", applyCustomChatRange)
+  // chat-from / chat-to listeners are attached inside renderCustomRangeField,
+  // since those inputs only exist in the DOM when "Custom range…" is selected.
+  // Render them now if the stored range is already custom.
+  renderCustomRangeField()
 
   // Marked-include toggle \u2014 persisted to OneDrive userPrefs; default ON.
   el<HTMLButtonElement>("marked-include").addEventListener("click", () => {
@@ -1019,18 +1077,20 @@ function wireGlobalHandlers(account: AccountInfo): void {
     saveUserPrefs(userCacheKey(), userPrefs)
     scheduleOneDriveSave()
     // Reload so the marked-include enrichment runs (or stops running).
-    if (!el<HTMLButtonElement>("refreshchats").hidden) {
-      clearCachedChats(userCacheKey())
-      chatsState = { chats: [] }
-      recordingsState = { containers: [], chatsScanned: 0, truncated: false }
-      recordingsMap = new Map()
-      el<HTMLUListElement>("chats").innerHTML = ""
-      void initialLoadChats()
-    }
+    reloadChatsWithCurrentSettings()
   })
 
-  // Include-messages toggle \u2014 gates whether messages are synced on container download.
+  // Include is a LOAD-SCOPE (both-on default). Can't turn both off \u2014 block the
+  // last-on chip from turning off (tooltip "Include at least one"). Build A keeps
+  // behavior unchanged (both default on); Build B wires the actual scope.
   el<HTMLButtonElement>("include-messages").addEventListener("click", () => {
+    const turningOff = userPrefs.includeMessages !== false
+    if (turningOff && userPrefs.includeRecordings === false) {
+      const btn = el<HTMLButtonElement>("include-messages")
+      btn.title = "Include at least one"
+      setStatus("Include at least one (Messages or Recordings).", "error")
+      return
+    }
     const next = userPrefs.includeMessages === false ? true : false
     userPrefs = { ...userPrefs, includeMessages: next }
     el<HTMLButtonElement>("include-messages").classList.toggle("active", next)
@@ -1038,14 +1098,33 @@ function wireGlobalHandlers(account: AccountInfo): void {
     scheduleOneDriveSave()
   })
 
-  // Include-recordings toggle \u2014 gates whether transcripts are synced on container download.
   el<HTMLButtonElement>("include-recordings").addEventListener("click", () => {
+    const turningOff = userPrefs.includeRecordings !== false
+    if (turningOff && userPrefs.includeMessages === false) {
+      const btn = el<HTMLButtonElement>("include-recordings")
+      btn.title = "Include at least one"
+      setStatus("Include at least one (Messages or Recordings).", "error")
+      return
+    }
     const next = userPrefs.includeRecordings === false ? true : false
     userPrefs = { ...userPrefs, includeRecordings: next }
     el<HTMLButtonElement>("include-recordings").classList.toggle("active", next)
     saveUserPrefs(userCacheKey(), userPrefs)
     scheduleOneDriveSave()
   })
+
+  // Change 3: Grouped/Flat view toggle \u2014 persisted in synced userPrefs.
+  const setViewMode = (mode: "grouped" | "flat") => {
+    if ((userPrefs.viewMode ?? "flat") === mode) return
+    userPrefs = { ...userPrefs, viewMode: mode }
+    el<HTMLButtonElement>("view-grouped").classList.toggle("active", mode === "grouped")
+    el<HTMLButtonElement>("view-flat").classList.toggle("active", mode === "flat")
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    rerenderContainerList()
+  }
+  el<HTMLButtonElement>("view-grouped").addEventListener("click", () => setViewMode("grouped"))
+  el<HTMLButtonElement>("view-flat").addEventListener("click", () => setViewMode("flat"))
 
   // Chat lookback: persists the download-depth selection only.
   el<HTMLSelectElement>("lookback").addEventListener("change", () => {
@@ -1241,14 +1320,37 @@ function rerenderContainerList(): void {
         : "Loosen the filters."
     }</li>`
   } else {
-    list.innerHTML = filtered
-      .map((c) => renderContainerRow(c, recordingsMap.get(c.id)))
-      .join("")
+    // Change 3: render grouped (chat rows that expand) or flat (every artifact
+    // its own top-level row). Both reuse the same artifact-row helpers, so
+    // Select / Download / Favorite behave identically across modes.
+    const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+    if (viewMode === "flat") {
+      list.innerHTML = renderFlatArtifactRows(filtered)
+    } else {
+      list.innerHTML = filtered
+        .map((c) => renderContainerRow(c, recordingsMap.get(c.id)))
+        .join("")
+    }
     list.querySelectorAll<HTMLButtonElement>(".container-action").forEach((btn) => {
       btn.addEventListener("click", () => {
         const id = btn.dataset.chatId!
         const name = btn.dataset.chatName!
         void syncContainer(id, name, btn)
+      })
+    })
+    // Change 1: per-artifact direct download (works in BOTH grouped & flat).
+    // Reuses the exact primitives downloadSelectedArtifacts calls; the clicked
+    // button shows its own progress/disabled state.
+    list.querySelectorAll<HTMLButtonElement>(".artifact-download").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.dataset.artKind === "recording") {
+          const recId = btn.dataset.recId!
+          void downloadRecordingTranscript(recId, btn)
+        } else {
+          const chatId = btn.dataset.chatId!
+          const chatName = btn.dataset.chatName || "chat"
+          void downloadChat(chatId, chatName, btn)
+        }
       })
     })
     // --- Phase 2: per-stream favorite toggles (live in the expanded view) ---
@@ -1350,10 +1452,20 @@ function rerenderContainerList(): void {
     })
   }
   updateTypeCountChips()
-  updateFiltersVisibility()
+  updateIgnoredControlsVisibility()
   updateContainerSummary(filtered.length)
   updateBulkButtons()
   updateSelectedButton()
+}
+
+/** Show/Clear-ignored controls render ONLY when there is something ignored.
+ * Show-ignored lives in §2 (VIEW); Clear-ignored is an action in §3 (DOWNLOAD). */
+function updateIgnoredControlsVisibility(): void {
+  const ignored = ignoredIds.size
+  const clearBtn = document.getElementById("clearignored") as HTMLButtonElement | null
+  if (clearBtn) clearBtn.hidden = ignored === 0
+  const showBtn = document.getElementById("showignored") as HTMLButtonElement | null
+  if (showBtn) showBtn.hidden = ignored === 0
 }
 
 function updateContainerSummary(visible: number): void {
@@ -1361,15 +1473,12 @@ function updateContainerSummary(visible: number): void {
   const favorited = favoritedChatIds().size
   const ignored = ignoredIds.size
   const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} ignored` : ""
-  // "Clear all ignored" is only relevant when something is ignored.
-  const clearBtn = document.getElementById("clearignored") as HTMLButtonElement | null
-  if (clearBtn) clearBtn.hidden = ignored === 0
   // Recording scan progress lives in #scan-status (Item 4); omit from main status.
   const filtered = visible < total
   if (filtered) {
     setStatus(`Showing ${visible} of ${total} loaded \u00b7 ${favorited} favorited${ignoredNote}`)
   } else {
-    setStatus(`${total} containers loaded \u00b7 ${favorited} favorited${ignoredNote}`)
+    setStatus(`${total} chats loaded \u00b7 ${favorited} favorited${ignoredNote}`)
   }
 }
 
@@ -1396,10 +1505,10 @@ function renderContainerRow(
     recIndicatorHtml = `<span class="rec-indicator" aria-label="${n} recording${n !== 1 ? "s" : ""}${truncNote}" title="${n} recording${n !== 1 ? "s" : ""} in range${truncNote}"><span aria-hidden="true">\uD83C\uDF99 ${n}</span></span>`
   }
 
-  // Effective download scope = toggles \u2229 what this row actually has.
-  const wantMessages = userPrefs.includeMessages !== false
+  // Effective download scope = captured load-time Include \u2229 what this row actually has.
+  const wantMessages = loadIncludeMessages
   const hasRecordings = recContainer !== undefined && recContainer.recordings.length > 0
-  const wantRecordings = userPrefs.includeRecordings !== false && hasRecordings
+  const wantRecordings = loadIncludeRecordings && hasRecordings
   let downloadBtnInner: string
   let downloadBtnDisabled = ""
   let downloadBtnTitle = ""
@@ -1448,35 +1557,116 @@ function renderContainerRow(
   `
 }
 
-/** Render the expanded artifact rows (Messages + per-recording) for a chat.
- * Called by renderContainerRow; reads selectedArtifacts for checkbox state. */
+/** Shared markup for the Messages artifact row.
+ *
+ * context "grouped" -> a <div> inside a chat's expanded .artifact-rows; the row
+ *   label is just "Messages" (the chat name is on the parent chat row).
+ * context "flat" -> a top-level <li> in the flat list; the chat name becomes the
+ *   primary label so the row is identifiable on its own.
+ *
+ * Carries: the per-artifact Select checkbox, the messages-stream Favorite ★, and
+ * the new per-artifact Download button (Change 1). */
+function messagesArtifactRowHtml(
+  chat: TeamsChatItem,
+  context: "grouped" | "flat",
+): string {
+  const chatId = chat.id
+  const chatName = chatDisplayName(chat)
+  const flat = context === "flat"
+  const msgArtId = `msg:${chatId}`
+  const msgSelected = selectedArtifacts.has(msgArtId)
+  const msgFav = isMessagesFavorited(chatId)
+  const lastSync = chatPrefs[chatId]?.lastSync
+  const dlTag = lastSync
+    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
+    : "Not downloaded yet"
+  const nameRaw = flat ? chatName : "Messages"
+  const subRaw = flat ? `Messages \u00b7 ${dlTag}` : dlTag
+  const tag = flat ? "li" : "div"
+  const flatClass = flat ? " artifact-flat" : ""
+  const ctxSuffix = flat ? ` for ${chatName}` : ""
+  return `
+    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">
+      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact${escapeHtml(ctxSuffix)}">
+      <button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>
+      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>
+      <div class="artifact-info">
+        <div class="artifact-name">${escapeHtml(nameRaw)}</div>
+        <div class="artifact-sub">${escapeHtml(subRaw)}</div>
+      </div>
+      <button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>
+    </${tag}>
+  `
+}
+
+/** Shared markup for a single Recording artifact row.
+ *
+ * context "grouped" -> a <div> indented under the recordings group header (which
+ *   carries the shared recordings-stream ★); the row itself shows no ★.
+ * context "flat" -> a top-level <li>; since there's no group header, EACH row
+ *   carries the shared recordings-stream ★ (toggling any toggles the one
+ *   chatId::rec favorite), and the chat name leads the label.
+ *
+ * Carries: the per-artifact Select checkbox and the new per-artifact Download
+ * button (Change 1). Recordings are never individually favoritable. */
+function recordingArtifactRowHtml(
+  chat: TeamsChatItem,
+  rec: RecordingItem,
+  context: "grouped" | "flat",
+): string {
+  const chatId = chat.id
+  const chatName = chatDisplayName(chat)
+  const flat = context === "flat"
+  const recArtId = `rec:${rec.id}`
+  const recSelected = selectedArtifacts.has(recArtId)
+  const dateLabel = formatDate(rec.eventCreatedDateTime)
+  const duration = formatIsoDuration(rec.durationIso)
+  const attendees = rec.participants
+    .filter((p) => p.kind === "user")
+    .map((p) => p.displayName)
+    .filter(Boolean)
+    .join(", ")
+  const recLastSync = recordingPrefs[rec.id]?.lastSync
+  const recTag = recLastSync
+    ? ` \u00b7 Downloaded ${formatDateShort(new Date(recLastSync))}`
+    : ""
+  const baseSub = [duration, attendees].filter(Boolean).join(" \u00b7 ")
+  const tag = flat ? "li" : "div"
+  const flatClass = flat ? " artifact-flat" : ""
+  const recFav = isRecordingsFavorited(chatId)
+  const favBtn = flat
+    ? `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
+    : ""
+  const nameRaw = flat ? chatName : `Recording \u2014 ${dateLabel}`
+  const subRaw = flat
+    ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}${recTag}`
+    : `${baseSub}${recTag}`
+  return `
+    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">
+      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">
+      ${favBtn}
+      <span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>
+      <div class="artifact-info">
+        <div class="artifact-name">${escapeHtml(nameRaw)}</div>
+        <div class="artifact-sub">${escapeHtml(subRaw)}</div>
+      </div>
+      <button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>
+    </${tag}>
+  `
+}
+
+/** Render the expanded artifact rows (Messages + per-recording) for a chat in
+ * GROUPED mode. Called by renderContainerRow. */
 function renderArtifactRows(
   chat: TeamsChatItem,
   recContainer: RecordingContainer | undefined,
 ): string {
-  const chatId = chat.id
-  const lastSync = chatPrefs[chatId]?.lastSync
-  const msgsTag = lastSync
-    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
-    : "Not downloaded yet"
-  const msgArtId = `msg:${chatId}`
-  const msgSelected = selectedArtifacts.has(msgArtId)
-  const msgFav = isMessagesFavorited(chatId)
-
-  let html = `
-    <div class="artifact-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">
-      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact">
-      <button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>
-      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>
-      <div class="artifact-info">
-        <div class="artifact-name">Messages</div>
-        <div class="artifact-sub">${escapeHtml(msgsTag)}</div>
-      </div>
-    </div>
-  `
+  // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
+  let html = loadIncludeMessages ? messagesArtifactRowHtml(chat, "grouped") : ""
 
   if (recContainer && recContainer.recordings.length > 0) {
     const n = recContainer.recordings.length
+    const chatId = chat.id
     const recFav = isRecordingsFavorited(chatId)
     // Recordings-stream favorite lives on a group header (the stream is the unit;
     // individual recordings are immutable and not separately favoritable).
@@ -1487,35 +1677,29 @@ function renderArtifactRows(
       </div>
     `
     for (const rec of recContainer.recordings) {
-      const recArtId = `rec:${rec.id}`
-      const recSelected = selectedArtifacts.has(recArtId)
-      const dateLabel = formatDate(rec.eventCreatedDateTime)
-      const duration = formatIsoDuration(rec.durationIso)
-      const attendees = rec.participants
-        .filter((p) => p.kind === "user")
-        .map((p) => p.displayName)
-        .filter(Boolean)
-        .join(", ")
-      const recLastSync = recordingPrefs[rec.id]?.lastSync
-      const recTag = recLastSync
-        ? ` \u00b7 Downloaded ${formatDateShort(new Date(recLastSync))}`
-        : ""
-      const sub = [duration, attendees].filter(Boolean).join(" \u00b7 ")
-
-      html += `
-        <div class="artifact-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">
-          <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact">
-          <span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>
-          <div class="artifact-info">
-            <div class="artifact-name">Recording \u2014 ${escapeHtml(dateLabel)}</div>
-            <div class="artifact-sub">${escapeHtml(sub + recTag)}</div>
-          </div>
-        </div>
-      `
+      html += recordingArtifactRowHtml(chat, rec, "grouped")
     }
   }
 
   return html
+}
+
+/** Render the FLAT view: every artifact as its own top-level <li> row, each
+ * carrying its chat's name for identifiability. Reuses the same row helpers as
+ * grouped mode so Select / Download / Favorite behave identically. */
+function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
+  const parts: string[] = []
+  for (const chat of chats) {
+    // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
+    if (loadIncludeMessages) parts.push(messagesArtifactRowHtml(chat, "flat"))
+    const rc = recordingsMap.get(chat.id)
+    if (rc && rc.recordings.length > 0) {
+      for (const rec of rc.recordings) {
+        parts.push(recordingArtifactRowHtml(chat, rec, "flat"))
+      }
+    }
+  }
+  return parts.join("")
 }
 
 /** Favoriting any stream clears the chat's ignored state (Favorite and Ignore
@@ -1642,35 +1826,214 @@ function updateTypeCountChips(): void {
     })
 }
 
-function updateFiltersVisibility(): void {
-  el<HTMLDivElement>("filters").hidden = chatsState.chats.length === 0
+// ----- §1 progressive disclosure: picker / checklist / receipt -----
+
+/** §1 shows the LOAD picker (the date/include/Load controls). */
+function showLoadPicker(): void {
+  const picker = document.getElementById("load-picker")
+  const checklist = document.getElementById("load-checklist")
+  const receipt = document.getElementById("load-receipt")
+  if (picker) picker.hidden = false
+  if (checklist) checklist.hidden = true
+  if (receipt) receipt.hidden = true
 }
 
-function showChatsRefreshButton(): void {
-  el<HTMLButtonElement>("loadchats").hidden = true
-  el<HTMLButtonElement>("refreshchats").hidden = false
+/** §1 shows the step-by-step loading CHECKLIST. */
+function showLoadChecklistView(): void {
+  const picker = document.getElementById("load-picker")
+  const checklist = document.getElementById("load-checklist")
+  const receipt = document.getElementById("load-receipt")
+  if (picker) picker.hidden = true
+  if (checklist) checklist.hidden = false
+  if (receipt) receipt.hidden = true
+}
+
+/** Reveal §2 VIEW and §3 DOWNLOAD (progressive disclosure: hidden until a load completes). */
+function revealPostLoadSections(): void {
+  const view = document.getElementById("section-view")
+  const dl = document.getElementById("section-download")
+  if (view) view.hidden = false
+  if (dl) dl.hidden = false
+}
+
+/** §1 collapses to a one-line RECEIPT, and §2/§3 are revealed. */
+function showLoadReceipt(): void {
+  const picker = document.getElementById("load-picker")
+  const checklist = document.getElementById("load-checklist")
+  const receipt = document.getElementById("load-receipt")
+  if (picker) picker.hidden = true
+  if (checklist) checklist.hidden = true
+  if (receipt) receipt.hidden = false
+  renderLoadReceipt()
+  revealPostLoadSections()
+}
+
+/** Render the receipt line: ✓ N chats · <range> · ★ favorites included [Change] [⟳ Reload]. */
+function renderLoadReceipt(): void {
+  const host = document.getElementById("load-receipt")
+  if (!host) return
+  const n = chatsState.chats.length
+  const rangeStr = chatRangeLabel(userPrefs.chatRange ?? { kind: "last-7d" }, chatPrefs)
+  const favNote = userPrefs.markedInclude !== false ? " \u00b7 \u2605 favorites included" : ""
+  host.innerHTML = `
+    <span class="receipt-text">\u2713 ${n} chat${n === 1 ? "" : "s"} \u00b7 ${escapeHtml(rangeStr)}${favNote}</span>
+    <button class="link-button" id="load-change">Change</button>
+    <button class="link-button" id="load-reload">\u27f3 Reload</button>
+  `
+  host.querySelector<HTMLButtonElement>("#load-change")
+    ?.addEventListener("click", () => showLoadPicker())
+  host.querySelector<HTMLButtonElement>("#load-reload")
+    ?.addEventListener("click", () => void refreshChats())
+}
+
+// ----- §1 loading checklist (real phase completion, not a timed bar) -----
+
+function initLoadSteps(): void {
+  loadSteps = [
+    { id: "signin", label: "Signed in", state: "done" },
+    { id: "chats", label: "Finding chats", state: "pending" },
+  ]
+  // Build B: with Recordings OFF the scan is skipped entirely, so omit its
+  // checklist step (any stray updateLoadStep("recordings", ...) safely no-ops).
+  if (loadIncludeRecordings) {
+    loadSteps.push({ id: "recordings", label: "Scanning recordings", state: "pending" })
+  }
+  loadSteps.push({ id: "done", label: "Done", state: "pending" })
+  renderLoadChecklist()
+}
+
+function updateLoadStep(id: LoadStep["id"], patch: Partial<LoadStep>): void {
+  const step = loadSteps.find((s) => s.id === id)
+  if (!step) return
+  Object.assign(step, patch)
+  renderLoadChecklist()
+}
+
+function renderLoadChecklist(): void {
+  const host = document.getElementById("load-checklist")
+  if (!host) return
+  host.innerHTML = loadSteps
+    .map((s) => {
+      const icon =
+        s.state === "done" ? "\u2713"
+        : s.state === "running" ? "\u27f3"
+        : s.state === "error" ? "\u2715"
+        : "\u00b7"
+      const text = s.state === "error" ? (s.error ?? "Failed") : (s.detail ?? s.label)
+      const retry =
+        s.state === "error"
+          ? ` <button class="link-button load-retry" data-step="${s.id}">Retry</button>`
+          : ""
+      return `<div class="load-step state-${s.state}"><span class="load-ico" aria-hidden="true">${icon}</span><span class="load-text">${escapeHtml(text)}</span>${retry}</div>`
+    })
+    .join("")
+  host.querySelectorAll<HTMLButtonElement>(".load-retry").forEach((btn) => {
+    btn.addEventListener("click", () => retryLoadStep(btn.dataset.step as LoadStep["id"]))
+  })
+}
+
+function retryLoadStep(step: LoadStep["id"]): void {
+  if (step === "chats") {
+    void initialLoadChats()
+  } else if (step === "recordings" && lastRecordingWindow) {
+    updateLoadStep("recordings", { state: "running", detail: "Scanning recordings\u2026", error: undefined })
+    void backgroundLoadRecordings(lastRecordingWindow.fromMs, lastRecordingWindow.toMs)
+  }
+}
+
+/** Mark the load complete: stamp hasLoadedOnce, collapse §1 to receipt, reveal §2/§3. */
+function finalizeLoad(): void {
+  hasLoadedOnce = true
+  updateLoadStep("done", { state: "done", detail: "Done" })
+  showLoadReceipt()
+}
+
+/** Reload the chat list with current settings, but only once a load has happened
+ * (replaces the old `!refreshchats.hidden` gate). Used by range/favorite-include changes. */
+function reloadChatsWithCurrentSettings(): void {
+  if (!hasLoadedOnce) return
+  clearCachedChats(userCacheKey())
+  chatsState = { chats: [] }
+  recordingsState = { containers: [], chatsScanned: 0, truncated: false }
+  recordingsMap = new Map()
+  el<HTMLUListElement>("chats").innerHTML = ""
+  void initialLoadChats()
+}
+
+/** Render the custom-range From/To inputs inline ONLY when "Custom range…" is the
+ * selected chat-range (render-when-custom; empties the field otherwise). */
+function renderCustomRangeField(): void {
+  const field = document.getElementById("chat-custom-range-field") as HTMLSpanElement | null
+  if (!field) return
+  const rangeSel = document.getElementById("chat-range") as HTMLSelectElement | null
+  const kind = rangeSel?.value ?? userPrefs.chatRange?.kind ?? "last-7d"
+  if (kind !== "custom") {
+    field.innerHTML = ""
+    return
+  }
+  const range = userPrefs.chatRange
+  const from =
+    (range?.kind === "custom" && range.customFrom) ||
+    toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
+  const to =
+    (range?.kind === "custom" && range.customTo) || toLocalDateString(new Date())
+  field.innerHTML = `
+    <span class="label">From</span>
+    <input type="date" id="chat-from" title="From (inclusive)" value="${from}" />
+    <span class="label">to</span>
+    <input type="date" id="chat-to" title="To (inclusive)" value="${to}" />
+  `
+  field.querySelector<HTMLInputElement>("#chat-from")?.addEventListener("change", applyCustomChatRange)
+  field.querySelector<HTMLInputElement>("#chat-to")?.addEventListener("change", applyCustomChatRange)
+}
+
+/** Persist a custom From/To selection and reload (if already loaded). */
+function applyCustomChatRange(): void {
+  const fromEl = document.getElementById("chat-from") as HTMLInputElement | null
+  const toEl = document.getElementById("chat-to") as HTMLInputElement | null
+  userPrefs = { ...userPrefs, chatRange: {
+    kind: "custom",
+    customFrom: fromEl?.value || undefined,
+    customTo: toEl?.value || undefined,
+  } }
+  saveUserPrefs(userCacheKey(), userPrefs)
+  scheduleOneDriveSave()
+  reloadChatsWithCurrentSettings()
 }
 
 // ----- Chats loading -----
 
 async function initialLoadChats(): Promise<void> {
   const userKey = userCacheKey()
+  // Build B: CAPTURE the §1 Include scope at load time. This is the single entry
+  // point for first-Load AND every Reload (refreshChats / reloadChatsWithCurrentSettings
+  // both funnel here), so capturing here covers all cases. Render/filter/action
+  // logic reads these captured values, not the live chips.
+  loadIncludeMessages = userPrefs.includeMessages !== false // default ON
+  loadIncludeRecordings = userPrefs.includeRecordings !== false // default ON
+  // Selection is per-load + scope-dependent; clear it so no stale (now-out-of-scope)
+  // artifact IDs linger across a reload.
+  selectedArtifacts.clear()
+
+  // §1 switches to the step-by-step loading checklist for the duration of the load.
+  // (initLoadSteps reads loadIncludeRecordings, so it must run AFTER the capture.)
+  initLoadSteps()
+  showLoadChecklistView()
+  updateLoadStep("chats", { state: "running", detail: "Finding chats\u2026" })
+
   const cached = loadCachedChats(userKey)
   if (cached && cached.chats.length > 0) {
     chatsState = { chats: cached.chats }
     rerenderContainerList()
-    showChatsRefreshButton()
     setStatus(
-      `Showing ${cached.chats.length} cached containers from ${formatAge(ageMs(cached))}. Refreshing\u2026`,
+      `Showing ${cached.chats.length} cached chats from ${formatAge(ageMs(cached))}. Refreshing\u2026`,
     )
   } else {
-    setStatus("Loading containers\u2026")
+    setStatus("Loading chats\u2026")
     el<HTMLUListElement>("chats").innerHTML = ""
   }
   const loadBtn = el<HTMLButtonElement>("loadchats")
-  const refreshBtn = el<HTMLButtonElement>("refreshchats")
   loadBtn.disabled = true
-  refreshBtn.disabled = true
 
   const range: ChatRange = userPrefs.chatRange ?? { kind: "last-7d" }
   const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
@@ -1744,35 +2107,58 @@ async function initialLoadChats(): Promise<void> {
     chatsState = { chats: kept }
     rerenderContainerList()
     saveCachedChats(userKey, kept)
-    showChatsRefreshButton()
-    setStatus(`${kept.length} containers (${rangeStr}).`)
+    updateLoadStep("chats", {
+      state: "done",
+      detail: `Found ${kept.length} chat${kept.length === 1 ? "" : "s"} \u00b7 \u2605 ${favoritedChatIds().size} favorites`,
+    })
+    setStatus(`${kept.length} chats (${rangeStr}).`)
   } catch (err) {
     if (kept.length > 0) {
       chatsState = { chats: kept }
       rerenderContainerList()
       saveCachedChats(userKey, kept)
+      updateLoadStep("chats", {
+        state: "done",
+        detail: `Found ${kept.length} chats (partial) \u00b7 \u2605 ${favoritedChatIds().size} favorites`,
+      })
+    } else {
+      // Hard failure with nothing loaded \u2014 surface the error + Retry on the chats
+      // line and STOP (don't reveal §2/§3 or collapse to a receipt).
+      updateLoadStep("chats", { state: "error", error: (err as Error).message })
     }
     setStatus(
       `Load failed: ${(err as Error).message}${
         cached
           ? " \u2014 showing cached."
           : kept.length > 0
-            ? ` \u2014 showing ${kept.length} partially loaded containers.`
+            ? ` \u2014 showing ${kept.length} partially loaded chats.`
             : ""
       }`,
       "error",
     )
   } finally {
     loadBtn.disabled = false
-    refreshBtn.disabled = false
+  }
+
+  // If nothing loaded, stay in the checklist (chats step shows error + Retry).
+  if (chatsState.chats.length === 0) {
+    updateLoadStep("recordings", { state: "pending", detail: undefined })
+    return
+  }
+
+  // Build B: Recordings OFF => SKIP the recording scan entirely (real fetch savings).
+  // The recordings checklist step was omitted in initLoadSteps, so just finalize the
+  // load directly (backgroundLoadRecordings would normally call finalizeLoad).
+  if (!loadIncludeRecordings) {
+    rerenderContainerList() // messages-only list (no recording artifacts)
+    finalizeLoad()
+    return
   }
 
   // After chats load, start background recordings scan using the same window.
-  if (chatsState.chats.length > 0) {
-    const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
-    const { cutoffMs: fromMs, untilMs: toMs } = computeChatWindow(range2, chatPrefs)
-    void backgroundLoadRecordings(fromMs, toMs)
-  }
+  const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
+  const { cutoffMs: fromMs, untilMs: toMs } = computeChatWindow(range2, chatPrefs)
+  void backgroundLoadRecordings(fromMs, toMs)
 }
 
 async function refreshChats(): Promise<void> {
@@ -1792,13 +2178,19 @@ async function refreshChats(): Promise<void> {
  * chats load; does NOT block the container list. Renders rows with a pending
  * indicator while scanning, then updates counts when the scan lands. */
 async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<void> {
+  lastRecordingWindow = { fromMs, toMs }
   recordingsMap = new Map()
   rerenderContainerList()
+  updateLoadStep("recordings", { state: "running", detail: "Scanning recordings\u2026", error: undefined })
   try {
     const result = await listRecordings(msal, {
       fromMs,
       toMs,
-      onProgress: (note) => setScanStatus(`\uD83C\uDF99 ${note}`),
+      onProgress: (note) => {
+        setScanStatus(`\uD83C\uDF99 ${note}`)
+        // Surface real scan progress (e.g. "38/142") on the checklist line.
+        updateLoadStep("recordings", { state: "running", detail: `Scanning recordings\u2026 ${note}` })
+      },
     })
     recordingsState.containers = result.containers
     recordingsState.chatsScanned = result.chatsScanned
@@ -1807,15 +2199,23 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
     const recTotal = result.containers.reduce((s, c) => s + c.recordings.length, 0)
     const withRecs = result.containers.filter((c) => c.recordings.length > 0).length
     const rangeStr = chatRangeLabel(userPrefs.chatRange ?? { kind: "last-7d" }, chatPrefs)
+    updateLoadStep("recordings", {
+      state: "done",
+      detail: `Scanned recordings \u00b7 ${recTotal} found across ${withRecs} chat${withRecs === 1 ? "" : "s"}`,
+    })
     setStatus(
-      `${chatsState.chats.length} containers (${rangeStr}) \u00b7 ${recTotal} recording(s) across ${withRecs} container(s)${result.truncated ? " \u00b7 (chat list truncated \u2014 narrow window)" : ""}.`,
+      `${chatsState.chats.length} chats (${rangeStr}) \u00b7 ${recTotal} recording(s) across ${withRecs} chat(s)${result.truncated ? " \u00b7 (chat list truncated \u2014 narrow window)" : ""}.`,
     )
   } catch (err) {
     console.warn("[m365-pull] Recordings scan failed:", err)
+    // Per-step error + Retry on the recordings line only; chats are still loaded,
+    // so we still finalize (reveal §2/§3 + receipt) in the finally below.
+    updateLoadStep("recordings", { state: "error", error: `Recordings scan failed: ${(err as Error).message}` })
     setStatus(`Recordings scan failed: ${(err as Error).message}`, "error")
   } finally {
     rerenderContainerList()
     setScanStatus("") // clear progress; row indicators show per-row state
+    finalizeLoad()
   }
 }
 
@@ -1826,8 +2226,10 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
 function countFavoritedStreams(): number {
   let n = 0
   for (const c of chatsState.chats) {
-    if (isMessagesFavorited(c.id)) n++
-    if (isRecordingsFavorited(c.id)) n++
+    // Build B: only count streams that are in the captured load scope, so the
+    // "Sync favorites (N)" count matches what syncFavorites will actually pull.
+    if (loadIncludeMessages && isMessagesFavorited(c.id)) n++
+    if (loadIncludeRecordings && isRecordingsFavorited(c.id)) n++
   }
   return n
 }
@@ -1851,13 +2253,24 @@ function updateBulkButtons(): void {
 /** Compute selected artifact count and update the #download-selected button label/visibility. */
 function updateSelectedButton(): void {
   const btn = document.getElementById("download-selected") as HTMLButtonElement | null
-  if (!btn) return
   const count = selectedArtifacts.size
-  if (count > 0) {
-    btn.hidden = false
-    btn.textContent = `Download selected (${count})`
-  } else {
-    btn.hidden = true
+  if (btn) {
+    if (count > 0) {
+      btn.hidden = false
+      btn.textContent = `Download selected (${count})`
+    } else {
+      btn.hidden = true
+    }
+  }
+  // §3 global "Select all" checkbox reflects whole-list selection state.
+  const globalCb = document.getElementById("select-all-global") as HTMLInputElement | null
+  if (globalCb) {
+    let total = 0
+    for (const c of chatsState.chats) {
+      total += getArtifactIds(c.id, recordingsMap.get(c.id)).length
+    }
+    globalCb.checked = count > 0 && count === total
+    globalCb.indeterminate = count > 0 && count < total
   }
 }
 
@@ -2203,11 +2616,13 @@ async function syncContainer(
   chatName: string,
   button: HTMLButtonElement,
 ): Promise<boolean> {
-  const includeMessages = userPrefs.includeMessages !== false // default ON
-  const includeRecordings = userPrefs.includeRecordings !== false // default ON
+  // Build B: use the CAPTURED load-time scope so the per-chat download matches the
+  // listed experience (not the live chips, which can't change post-load anyway).
+  const includeMessages = loadIncludeMessages
+  const includeRecordings = loadIncludeRecordings
 
   if (!includeMessages && !includeRecordings) {
-    setStatus("No artifact type selected \u2014 enable Include: Messages and/or Include: Transcripts.", "error")
+    setStatus("No artifact type selected \u2014 enable Include: Messages and/or Include: Recordings.", "error")
     return false
   }
 
@@ -2242,8 +2657,11 @@ async function syncFavorites(): Promise<void> {
     | { kind: "recordings"; chat: TeamsChatItem }
   const tasks: StreamTask[] = []
   for (const chat of chatsState.chats) {
-    if (isMessagesFavorited(chat.id)) tasks.push({ kind: "messages", chat })
-    if (isRecordingsFavorited(chat.id)) tasks.push({ kind: "recordings", chat })
+    // Build B: only sync streams that are in the captured load scope, matching the
+    // listed experience. A suppressed type is simply not acted on; the stored
+    // favorite is untouched (not deleted).
+    if (loadIncludeMessages && isMessagesFavorited(chat.id)) tasks.push({ kind: "messages", chat })
+    if (loadIncludeRecordings && isRecordingsFavorited(chat.id)) tasks.push({ kind: "recordings", chat })
   }
   if (tasks.length === 0) return
 

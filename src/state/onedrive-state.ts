@@ -54,6 +54,10 @@ export interface UserPrefs {
   includeMessages?: boolean
   /** When true (default), sync transcripts when downloading a container. */
   includeRecordings?: boolean
+  /** Container list view mode. "flat" (default) = every artifact rendered as its
+   * own top-level row; "grouped" = chat rows that expand into their artifacts.
+   * When unset/undefined, the app resolves this to "flat". */
+  viewMode?: "grouped" | "flat"
 }
 
 export interface AppState {
@@ -175,7 +179,9 @@ export function mergeStates(
     ...(newer.recordingPrefs ?? {}),
   }
   return {
-    version: 1,
+    // Carry-over fix: emit v2 so the v1->v2 favorites migration guard fires once,
+    // not on every sync (a v1 stamp here re-triggered migration each merge).
+    version: 2,
     updatedAt: new Date().toISOString(),
     updatedBy: local.updatedBy || remote.updatedBy,
     marks: [...marks].sort(),
