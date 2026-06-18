@@ -74,61 +74,11 @@ await msal.initialize()
 const redirectResp = await msal.handleRedirectPromise()
 if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
 
-// EasyAuth edge-gate bridge (non-blocking).
-//
-// In production the Static Web App enforces an EasyAuth access-gate: anonymous
-// users are redirected to Entra and authenticated BEFORE this bundle ever loads
-// (see staticwebapp.config.json). EasyAuth's session is a server-side SWA cookie
-// \u2014 it does NOT populate MSAL's cache \u2014 so without this bridge the user would be
-// prompted to sign in a SECOND time by MSAL.js. ssoSilent rides the shared Entra
-// session cookie established by the EasyAuth login to silently establish an MSAL
-// account, collapsing the two logins into a single visible ceremony.
-//
-// Local dev has no EasyAuth (Vite serves no /.auth endpoint); every step below
-// fails soft and falls through to the interactive sign-in button in render().
-//
-// The bridge runs as a background async task (not awaited at module top-level) so
-// first paint is not delayed by the MSAL iframe round-trip. render() is called
-// immediately at module end with whatever auth state is already available; the
-// bridge calls render() again on completion to upgrade the UI. ssoSilentInProgress
-// tells render() to show a loading state while the bridge is in flight rather than
-// flashing the sign-in button.
-let ssoSilentInProgress = false
-
 if (!msal.getActiveAccount()) {
   const cached = msal.getAllAccounts()
   if (cached.length > 0) {
     // Returning visit \u2014 reuse the account MSAL already cached (sync, instant).
     msal.setActiveAccount(cached[0])
-  } else {
-    // No cached account: the bridge needs a network round-trip (/.auth/me + MSAL
-    // iframe). Run it in the background so first paint is immediate.
-    ssoSilentInProgress = true
-    void (async () => {
-      try {
-        // Pull the signed-in user's UPN from EasyAuth so ssoSilent can target them.
-        let loginHint: string | undefined
-        try {
-          const me = await fetch("/.auth/me")
-          if (me.ok) {
-            const data = await me.json()
-            loginHint = data?.clientPrincipal?.userDetails || undefined
-          }
-        } catch {
-          // /.auth/me unavailable (local dev) \u2014 attempt ssoSilent without a hint.
-        }
-        // Minimal scope just to establish the account/session; per-call tokens for
-        // Chat.Read / Files.* are acquired later via acquireTokenSilent (already
-        // consented on the MSAL registration), so no extra prompt results.
-        const sso = await msal.ssoSilent(loginHint ? { scopes: ["User.Read"], loginHint } : { scopes: ["User.Read"] })
-        if (sso?.account) msal.setActiveAccount(sso.account)
-      } catch {
-        // No silent session bridge available \u2014 render() will show the sign-in button.
-      } finally {
-        ssoSilentInProgress = false
-        render()
-      }
-    })()
   }
 }
 
@@ -811,12 +761,6 @@ function countByType(chats: TeamsChatItem[]): Map<string, number> {
 function render(): void {
   const account = msal.getActiveAccount()
   if (!account) {
-    if (ssoSilentInProgress) {
-      // Bridge still in flight \u2014 show a minimal loading state so #app is not blank.
-      // render() will be called again by the bridge IIFE when it resolves.
-      app.innerHTML = `<div class="signin-card"><h1>m365-pull</h1><p>Signing in\u2026</p></div>`
-      return
-    }
     app.innerHTML = `
       <div class="signin-card">
         <h1>m365-pull</h1>
