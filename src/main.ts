@@ -1013,7 +1013,11 @@ function wireGlobalHandlers(account: AccountInfo): void {
     saveUserPrefs(userCacheKey(), userPrefs)
     scheduleOneDriveSave()
     renderCustomRangeField()
-    reloadChatsWithCurrentSettings()
+    // Do NOT auto-load here. Changing the dropdown (including selecting "custom")
+    // only persists the preference and reveals/hides the date inputs. The user
+    // must press an explicit Load / Refresh button to trigger a data fetch.
+    // (Bug fix: dropdown change was firing a reload before "custom" dates could
+    // be set, and before any explicit user intent to reload.)
   })
 
   // chat-from / chat-to listeners are attached inside renderCustomRangeField,
@@ -1638,8 +1642,44 @@ function renderArtifactRows(
 
 /** Render the FLAT view: every artifact as its own top-level <li> row, each
  * carrying its chat's name for identifiability. Reuses the same row helpers as
- * grouped mode so Select / Download / Favorite behave identically. */
+ * grouped mode so Select / Download / Favorite behave identically.
+ *
+ * When sort is "recent" (by date) we perform a GLOBAL sort across all artifacts
+ * so that individual recordings from a recurring meeting interleave
+ * chronologically with artifacts from other containers, rather than clustering
+ * back-to-back under their shared container. For name / marked-first sorts the
+ * chats array is already correctly ordered at the container level, so we emit
+ * artifacts in container order (which is the natural expected grouping for
+ * those sort keys). */
 function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
+  if (filterState.sortKey === "recent") {
+    // Build every artifact with its own per-artifact sort timestamp, then sort
+    // globally so e.g. 4 recordings of "Weekly Standup" from different weeks
+    // interleave with other items that happened between those weeks.
+    const items: { ms: number; html: string }[] = []
+    for (const chat of chats) {
+      if (loadIncludeMessages) {
+        items.push({
+          ms: chatActivityDate(chat),
+          html: messagesArtifactRowHtml(chat, "flat"),
+        })
+      }
+      const rc = recordingsMap.get(chat.id)
+      if (rc && rc.recordings.length > 0) {
+        for (const rec of rc.recordings) {
+          items.push({
+            ms: new Date(rec.eventCreatedDateTime).getTime(),
+            html: recordingArtifactRowHtml(chat, rec, "flat"),
+          })
+        }
+      }
+    }
+    items.sort((a, b) => b.ms - a.ms)
+    return items.map((i) => i.html).join("")
+  }
+  // name / marked-first: the chats array is already sorted at the container
+  // level; emit artifacts in container order so items from the same named
+  // container stay together (which is the natural expectation for name sort).
   const parts: string[] = []
   for (const chat of chats) {
     // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
@@ -1924,33 +1964,40 @@ function renderCustomRangeField(): void {
     return
   }
   const range = userPrefs.chatRange
+  const today = toLocalDateString(new Date())
   const from =
     (range?.kind === "custom" && range.customFrom) ||
     toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
   const to =
-    (range?.kind === "custom" && range.customTo) || toLocalDateString(new Date())
+    (range?.kind === "custom" && range.customTo) || today
   field.innerHTML = `
     <span class="label">From</span>
-    <input type="date" id="chat-from" title="From (inclusive)" value="${from}" />
+    <input type="date" id="chat-from" title="From (inclusive)" value="${from}" max="${today}" />
     <span class="label">to</span>
-    <input type="date" id="chat-to" title="To (inclusive)" value="${to}" />
+    <input type="date" id="chat-to" title="To (inclusive)" value="${to}" max="${today}" />
   `
   field.querySelector<HTMLInputElement>("#chat-from")?.addEventListener("change", applyCustomChatRange)
   field.querySelector<HTMLInputElement>("#chat-to")?.addEventListener("change", applyCustomChatRange)
 }
 
-/** Persist a custom From/To selection and reload (if already loaded). */
+/** Persist a custom From/To selection without auto-reloading.
+ * The user must press Load / Refresh to actually fetch data with the new range.
+ * Values are clamped to today so future dates can't slip through even if the
+ * browser's max attribute is bypassed. */
 function applyCustomChatRange(): void {
   const fromEl = document.getElementById("chat-from") as HTMLInputElement | null
   const toEl = document.getElementById("chat-to") as HTMLInputElement | null
+  const today = toLocalDateString(new Date())
+  const clampToToday = (v: string | undefined) =>
+    v && v > today ? today : v
   userPrefs = { ...userPrefs, chatRange: {
     kind: "custom",
-    customFrom: fromEl?.value || undefined,
-    customTo: toEl?.value || undefined,
+    customFrom: clampToToday(fromEl?.value || undefined),
+    customTo: clampToToday(toEl?.value || undefined),
   } }
   saveUserPrefs(userCacheKey(), userPrefs)
   scheduleOneDriveSave()
-  reloadChatsWithCurrentSettings()
+  // No auto-reload — the user explicitly presses Load / Refresh.
 }
 
 // ----- Chats loading -----
