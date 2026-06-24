@@ -1,18 +1,20 @@
 # Amplifier Online - Azure Static Web App Stack Configuration
 # Documentation: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
 
-name: m365-pull-v2
+name: m365-pull
 stack: static-web-app
 
-# Bring your own Entra app registration.
-# The platform validates but does not create or modify the app registration.
-# You are responsible for configuring identifier URIs, scopes, and redirect URIs.
+# Bring your own Entra app registration (BYO EasyAuth login app).
+# 63231eb0 is our SINGLE-TENANT app (also the SPA's MSAL/Graph client). Using it as the
+# EasyAuth login app pins AZURE_CLIENT_ID -> this app; combined with the tenant-pinned
+# openIdIssuerUri in staticwebapp.config.json, personal MSA accounts are rejected at the gate.
+# No api_app_id: the SPA calls Microsoft Graph directly, it has no own API audience to validate.
 auth:
-  client_id: "63231eb0-9b53-4342-8ac4-5209d618684e"
+  client_app_id: "63231eb0-9b53-4342-8ac4-5209d618684e"
 
 # Push-to-deploy configuration (project-level default).
 deploy:
-  repo: "https://github.com/bkrabach/m365-pull.git"
+  repo: "https://github.com/bkrabach/m365-pull"
   ref: refs/heads/main
 
 # Static frontend (built and deployed by GitHub Actions)
@@ -20,11 +22,11 @@ deploy:
 # Configure login requirements via staticwebapp.config.json in your repo.
 frontend:
   type: static-web-app
-  repo: "https://github.com/bkrabach/m365-pull.git"
+  repo: ""  # REQUIRED: GitHub repo URL (e.g., https://github.com/your-org/your-repo)
   branch: main
-  app_location: "/"  # m365-pull is the repo root in its own submodule
-  output_location: "dist"  # matches vite.config.ts build.outDir
-  build_command: "npm run build"  # tsc && vite build
+  app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
+  output_location: "dist"  # Build output directory (must match vite/webpack/next config)
+  build_command: "npm run build"  # Optional - defaults to "npm run build"
 
 # Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
 # Need backend API? Use web-app-awa (Web App + Static Web App)
