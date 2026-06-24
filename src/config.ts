@@ -10,12 +10,15 @@
 
 export const config = {
   // Application (client) ID from your Entra app registration.
-  // VITE_AZURE_CLIENT_ID is injected at build time by the Amplifier Online
-  // SWA platform (EasyAuth BYO app registration). Falls back to the legacy
-  // VITE_MSAL_CLIENT_ID for local dev via .env.local.
+  // VITE_MSAL_CLIENT_ID (SPA-consented app, has Teams/Channel Graph scopes)
+  // takes precedence over VITE_AZURE_CLIENT_ID (EasyAuth platform app, which
+  // only has EasyAuth scopes — NOT the channel Graph scopes). EasyAuth's
+  // server-side app is chosen by staticwebapp.config.json's
+  // clientIdSettingName="AZURE_CLIENT_ID" (a separate server env var),
+  // so this SPA clientId flip is EasyAuth-safe.
   clientId:
-    import.meta.env.VITE_AZURE_CLIENT_ID ??
     import.meta.env.VITE_MSAL_CLIENT_ID ??
+    import.meta.env.VITE_AZURE_CLIENT_ID ??
     "",
 
   // Directory (tenant) ID — your tenant's GUID.

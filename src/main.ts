@@ -10,7 +10,7 @@ import {
   type TeamsChatItem,
   type TeamsChatMessage,
 } from "./sources/teams-chats"
-import { formatDateStamp } from "./sources/filename-format"
+import { formatDateStamp, sanitizeFilenameName } from "./sources/filename-format"
 import {
   listRecordings,
   buildTranscriptFilename,
@@ -23,6 +23,12 @@ import {
 } from "./sources/teams-recordings"
 import { vttToMarkdown } from "./format/transcript-markdown"
 import { renderChatMarkdown } from "./format/chat-markdown"
+import { threadToMarkdown, buildThreadFilename } from "./format/channel-markdown"
+import {
+  listChannels,
+  fetchChannelThreadsInRange,
+  type ChannelContainer,
+} from "./sources/teams-channels"
 import { saveAsText } from "./destinations/browser"
 import { saveTextToOneDrive, getOneDriveFolderWebUrl } from "./destinations/onedrive"
 import {
@@ -126,10 +132,14 @@ const SIGNIN_SCOPES = [
   "Files.Read.All",
   "Files.ReadWrite",
   "Files.ReadWrite.AppFolder",
+  "Team.ReadBasic.All",
+  "Channel.ReadBasic.All",
+  "ChannelMessage.Read.All",
 ]
 
 let chatsState: ChatsState = { chats: [] }
 let recordingsState: RecordingsState = { containers: [], chatsScanned: 0, truncated: false }
+let channelsState: { containers: ChannelContainer[] } = { containers: [] }
 /** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
 let recordingsMap: Map<string, RecordingContainer> = new Map()
 /** True while the background recordings scan is running; rows show pending indicator. */
@@ -180,7 +190,7 @@ let loadIncludeRecordings = true
 
 type LoadStepState = "pending" | "running" | "done" | "error"
 interface LoadStep {
-  id: "signin" | "chats" | "recordings" | "done"
+  id: "signin" | "chats" | "channels" | "recordings" | "done"
   label: string
   detail?: string
   state: LoadStepState
@@ -1412,6 +1422,8 @@ function rerenderContainerList(): void {
   updateContainerSummary(filtered.length)
   updateBulkButtons()
   updateSelectedButton()
+  // Append Teams channel rows after all chat rows (parallel track, own keys).
+  renderChannelRows()
 }
 
 /** Show/Clear-ignored controls render ONLY when there is something ignored.
@@ -1919,6 +1931,7 @@ function initLoadSteps(): void {
   loadSteps = [
     { id: "signin", label: "Signed in", state: "done" },
     { id: "chats", label: "Finding chats", state: "pending" },
+    { id: "channels", label: "Listing channels", state: "pending" },
   ]
   // Build B: with Recordings OFF the scan is skipped entirely, so omit its
   // checklist step (any stray updateLoadStep("recordings", ...) safely no-ops).
@@ -1983,6 +1996,7 @@ function reloadChatsWithCurrentSettings(): void {
   chatsState = { chats: [] }
   recordingsState = { containers: [], chatsScanned: 0, truncated: false }
   recordingsMap = new Map()
+  channelsState = { containers: [] }
   el<HTMLUListElement>("chats").innerHTML = ""
   void initialLoadChats()
 }
@@ -2185,13 +2199,17 @@ async function initialLoadChats(): Promise<void> {
   // load directly (backgroundLoadRecordings would normally call finalizeLoad).
   if (!loadIncludeRecordings) {
     rerenderContainerList() // messages-only list (no recording artifacts)
+    void backgroundLoadChannels()
     finalizeLoad()
     return
   }
 
-  // After chats load, start background recordings scan using the same window.
+  // After chats load, start background channels and recordings scans using the
+  // same window. Channels run in parallel with recordings; neither gates the
+  // other. finalizeLoad() is called by backgroundLoadRecordings as before.
   const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
   const { cutoffMs: fromMs, untilMs: toMs } = computeChatWindow(range2, chatPrefs)
+  void backgroundLoadChannels()
   void backgroundLoadRecordings(fromMs, toMs)
 }
 
@@ -2200,9 +2218,10 @@ async function refreshChats(): Promise<void> {
   clearCachedChats(userCacheKey())
   chatsState = { chats: [] }
   el<HTMLUListElement>("chats").innerHTML = ""
-  // Reset recordings state; initialLoadChats will re-kick the scan.
+  // Reset recordings + channels state; initialLoadChats will re-kick the scans.
   recordingsState = { containers: [], chatsScanned: 0, truncated: false }
   recordingsMap = new Map()
+  channelsState = { containers: [] }
   await initialLoadChats()
 }
 
@@ -2250,6 +2269,173 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
     rerenderContainerList()
     setScanStatus("") // clear progress; row indicators show per-row state
     finalizeLoad()
+  }
+}
+
+// ----- Background channels load -----
+
+/** Fetch all joined teams + channels in the background; updates channelsState
+ * and appends channel rows to the container list.  Does NOT call finalizeLoad()
+ * so it can run in parallel with backgroundLoadRecordings. */
+async function backgroundLoadChannels(): Promise<void> {
+  updateLoadStep("channels", { state: "running", detail: "Listing channels\u2026", error: undefined })
+  try {
+    const containers = await listChannels(msal, {
+      onProgress: (note) => {
+        updateLoadStep("channels", { state: "running", detail: `Listing channels\u2026 ${note}` })
+      },
+    })
+    channelsState.containers = containers
+    updateLoadStep("channels", {
+      state: "done",
+      detail: `Channels listed \u00b7 ${containers.length} channel${containers.length === 1 ? "" : "s"} across ${new Set(containers.map((c) => c.teamId)).size} team(s)`,
+    })
+    renderChannelRows()
+  } catch (err) {
+    console.warn("[m365-pull] Channels load failed:", err)
+    updateLoadStep("channels", {
+      state: "error",
+      error: `Channels load failed: ${(err as Error).message}`,
+    })
+  }
+}
+
+// ----- Render channel rows -----
+
+/** Append Teams channel rows (own section) after the chat rows in #chats.
+ * Idempotent: removes any existing channel section before re-rendering.
+ * Keyed by data-channel-id (NOT data-chat-id) to stay separate from chat machinery. */
+function renderChannelRows(): void {
+  const list = document.getElementById("chats") as HTMLUListElement | null
+  if (!list) return
+
+  // Remove any prior channel section.
+  list.querySelectorAll(".channel-section-header, .channel-row").forEach((el) => el.remove())
+
+  if (channelsState.containers.length === 0) return
+
+  const header = document.createElement("li")
+  header.className = "channel-section-header"
+  header.innerHTML = `<span>Channels (${channelsState.containers.length})</span>`
+  list.appendChild(header)
+
+  for (const c of channelsState.containers) {
+    const li = document.createElement("li")
+    li.className = "chat-row channel-row"
+    li.innerHTML = `
+      <div class="chat-row-header">
+        <div class="chat-info">
+          <div class="chat-name">${escapeHtml(c.channelName)}</div>
+          <div class="chat-sub">${escapeHtml(c.teamName)}</div>
+        </div>
+        <button class="container-action" data-channel-id="${escapeHtml(c.id)}" aria-label="Download channel ${escapeHtml(c.channelName)}">Download</button>
+      </div>
+    `
+    // Wire up event: .container-action[data-channel-id] -> downloadChannel
+    const btn = li.querySelector<HTMLButtonElement>(".container-action[data-channel-id]")!
+    btn.addEventListener("click", () => {
+      const channelId = btn.dataset.channelId!
+      const container = channelsState.containers.find((x) => x.id === channelId)
+      if (!container) return
+      void downloadChannel(container, btn)
+    })
+    list.appendChild(li)
+  }
+}
+
+// ----- Download channel threads -----
+
+/** Download all threads in the active window for a Teams channel.
+ * Mirrors downloadRecordingTranscript's destination switch and status pattern. */
+async function downloadChannel(
+  container: ChannelContainer,
+  button: HTMLButtonElement,
+): Promise<void> {
+  const originalLabel = button.textContent
+  button.disabled = true
+  button.textContent = "Fetching\u2026"
+
+  // Resolve window: reuse the same window as the recordings scan (one source of truth).
+  const { fromMs, toMs } = lastRecordingWindow ??
+    (() => {
+      const range = userPrefs.chatRange ?? { kind: "last-7d" }
+      const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
+      return { fromMs: cutoffMs, toMs: untilMs }
+    })()
+
+  const channelLabel = `${container.teamName} / ${container.channelName}`
+  setStatus(`Fetching threads for "${channelLabel}"\u2026`)
+
+  try {
+    const { threads, truncated } = await fetchChannelThreadsInRange(msal, container, {
+      fromMs,
+      toMs,
+      maxPages: 20,
+      onProgress: (note) => {
+        setStatus(`${channelLabel}: ${note}`)
+      },
+    })
+
+    if (threads.length === 0) {
+      setStatus(`No threads in window for "${channelLabel}".`)
+      return
+    }
+
+    button.textContent = "Saving\u2026"
+    const destination = userPrefs.destination
+    const baseFolder =
+      `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/channels/` +
+      `${sanitizeFilenameName(container.teamName)}/${sanitizeFilenameName(container.channelName)}`
+    const sourceLabel = `${container.teamName} / ${container.channelName}`
+
+    let saved = 0
+    let cancelled = false
+
+    for (const thread of threads) {
+      const filename = buildThreadFilename(thread, ".md")
+      const markdown = threadToMarkdown(thread, sourceLabel)
+
+      let result: { saved: boolean; reason?: string; path?: string }
+
+      if (destination === "onedrive") {
+        const fullPath = `${baseFolder}/${filename}`
+        result = await saveTextToOneDrive(msal, fullPath, markdown, "text/markdown")
+      } else {
+        result = await saveAsText(filename, markdown, {
+          extension: ".md",
+          description: "Markdown",
+          mimeType: "text/markdown",
+        })
+      }
+
+      if (result.saved) {
+        saved++
+      } else if (result.reason === "cancelled") {
+        cancelled = true
+        break
+      } else if (result.reason === "unsupported") {
+        setStatus(`Save not supported in this browser.`, "error")
+        return
+      }
+    }
+
+    if (cancelled) {
+      setStatus(`Save cancelled. (${saved} of ${threads.length} threads written.)`)
+      return
+    }
+
+    const truncNote = truncated ? " (window may be incomplete)" : ""
+    if (destination === "onedrive") {
+      setStatus(`\u2713 Saved ${saved} thread(s) for "${channelLabel}" to OneDrive.${truncNote}`)
+    } else {
+      setStatus(`\u2713 Saved ${saved} thread(s) for "${channelLabel}".${truncNote}`)
+    }
+  } catch (err) {
+    setStatus(`Error: ${(err as Error).message}`, "error")
+    console.error("[m365-pull] downloadChannel failed:", err)
+  } finally {
+    button.disabled = false
+    button.textContent = originalLabel || "Download"
   }
 }
 
