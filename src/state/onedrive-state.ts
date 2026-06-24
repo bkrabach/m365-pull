@@ -61,6 +61,9 @@ export interface UserPrefs {
   /** Team IDs whose channels are shown in the unified list.
    * Default = [] (no channels shown until the user picks teams). */
   selectedTeamIds?: string[]
+  /** How channel threads are downloaded. "single" = all threads in the window
+   * rolled into one combined file (default); "per-thread" = one file per thread. */
+  channelDownloadMode?: "single" | "per-thread"
 }
 
 export interface AppState {

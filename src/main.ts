@@ -10,7 +10,7 @@ import {
   type TeamsChatItem,
   type TeamsChatMessage,
 } from "./sources/teams-chats"
-import { formatDateStamp, sanitizeFilenameName } from "./sources/filename-format"
+import { formatDateStamp, formatPulledStamp } from "./sources/filename-format"
 import {
   listRecordings,
   buildTranscriptFilename,
@@ -23,7 +23,7 @@ import {
 } from "./sources/teams-recordings"
 import { vttToMarkdown } from "./format/transcript-markdown"
 import { renderChatMarkdown } from "./format/chat-markdown"
-import { threadToMarkdown, buildThreadFilename } from "./format/channel-markdown"
+import { threadToMarkdown, buildThreadFilename, threadsToChannelMarkdown, buildChannelFilename } from "./format/channel-markdown"
 import {
   listTeams,
   listChannels,
@@ -885,6 +885,14 @@ function render(): void {
               <option value="onedrive">OneDrive folder</option>
             </select>
             <span class="form-help">Where to save downloads by default. You can override this from the main action row.</span>
+          </label>
+          <label class="form-field">
+            <span class="form-label">Channel download</span>
+            <select id="settings-channel-mode" class="form-input">
+              <option value="single">Single file (default)</option>
+              <option value="per-thread">File per thread</option>
+            </select>
+            <span class="form-help">How channel threads are saved. \u201cSingle file\u201d rolls all threads in the window into one combined file. \u201cFile per thread\u201d saves each thread as its own file (original behavior).</span>
           </label>
           <div class="form-field">
             <span class="form-label">Account</span>
@@ -3065,16 +3073,15 @@ async function downloadChannelThread(
   button.textContent = "Saving\u2026"
 
   const sourceLabel = `${container.teamName} / ${container.channelName}`
-  const filename = buildThreadFilename(thread, ".md")
+  const pulledStamp = formatPulledStamp(new Date())
+  const filename = buildThreadFilename(thread, container.teamName, container.channelName, pulledStamp, ".md")
   const markdown = threadToMarkdown(thread, sourceLabel)
 
   try {
     let result: { saved: boolean; reason?: string }
     if (userPrefs.destination === "onedrive") {
-      const baseFolder =
-        `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/channels/` +
-        `${sanitizeFilenameName(container.teamName)}/${sanitizeFilenameName(container.channelName)}`
-      result = await saveTextToOneDrive(msal, `${baseFolder}/${filename}`, markdown, "text/markdown")
+      const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${filename}`
+      result = await saveTextToOneDrive(msal, fullPath, markdown, "text/markdown")
     } else {
       result = await saveAsText(filename, markdown, {
         extension: ".md",
@@ -3138,22 +3145,72 @@ async function downloadChannel(
 
     button.textContent = "Saving\u2026"
     const destination = userPrefs.destination
-    const baseFolder =
-      `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/channels/` +
-      `${sanitizeFilenameName(container.teamName)}/${sanitizeFilenameName(container.channelName)}`
+    // Compute the pulled stamp once for this run so all threads share the same
+    // version key (mirrors the chat/recording convention).
+    const pulledStamp = formatPulledStamp(new Date())
     const sourceLabel = `${container.teamName} / ${container.channelName}`
+    const truncNote = truncated ? " (window may be incomplete)" : ""
 
+    if ((userPrefs.channelDownloadMode ?? "single") === "single") {
+      // Single-file mode (default): roll all in-window threads into one combined
+      // file named after the channel + window range, mirroring the chat grammar.
+      const rangeStart = formatDateStamp(new Date(fromMs))
+      const rangeEnd = formatDateStamp(new Date(toMs))
+      const filename = buildChannelFilename(
+        container.teamName, container.channelName, pulledStamp, rangeStart, rangeEnd, ".md",
+      )
+      const markdown = threadsToChannelMarkdown(
+        threads, container.teamName, container.channelName, rangeStart, rangeEnd,
+      )
+
+      let result: { saved: boolean; reason?: string; path?: string }
+      if (destination === "onedrive") {
+        const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${filename}`
+        result = await saveTextToOneDrive(msal, fullPath, markdown, "text/markdown")
+      } else {
+        result = await saveAsText(filename, markdown, {
+          extension: ".md",
+          description: "Markdown",
+          mimeType: "text/markdown",
+        })
+      }
+
+      if (result.saved) {
+        chatPrefs = {
+          ...chatPrefs,
+          [container.id]: {
+            ...(chatPrefs[container.id] ?? {}),
+            lastSync: new Date().toISOString(),
+          },
+        }
+        saveChatPrefs(userCacheKey(), chatPrefs)
+        scheduleOneDriveSave()
+        renderChannelSection()
+        if (destination === "onedrive") {
+          setStatus(`\u2713 Saved ${threads.length} thread(s) for "${channelLabel}" as one file to OneDrive.${truncNote}`)
+        } else {
+          setStatus(`\u2713 Saved ${threads.length} thread(s) for "${channelLabel}" as one file.${truncNote}`)
+        }
+      } else if (result.reason === "cancelled") {
+        setStatus("Save cancelled.")
+      } else if (result.reason === "unsupported") {
+        setStatus("Save not supported in this browser.", "error")
+      }
+      return
+    }
+
+    // per-thread mode: existing behavior — one file per thread.
     let saved = 0
     let cancelled = false
 
     for (const thread of threads) {
-      const filename = buildThreadFilename(thread, ".md")
+      const filename = buildThreadFilename(thread, container.teamName, container.channelName, pulledStamp, ".md")
       const markdown = threadToMarkdown(thread, sourceLabel)
 
       let result: { saved: boolean; reason?: string; path?: string }
 
       if (destination === "onedrive") {
-        const fullPath = `${baseFolder}/${filename}`
+        const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${filename}`
         result = await saveTextToOneDrive(msal, fullPath, markdown, "text/markdown")
       } else {
         result = await saveAsText(filename, markdown, {
@@ -3179,7 +3236,6 @@ async function downloadChannel(
       return
     }
 
-    const truncNote = truncated ? " (window may be incomplete)" : ""
     if (destination === "onedrive") {
       setStatus(`\u2713 Saved ${saved} thread(s) for "${channelLabel}" to OneDrive.${truncNote}`)
     } else {
@@ -3777,6 +3833,7 @@ function openSettingsModal(): void {
   const modal = el<HTMLDivElement>("settings-modal")
   el<HTMLInputElement>("settings-folder").value = userPrefs.oneDriveFolder
   el<HTMLSelectElement>("settings-destination").value = userPrefs.destination
+  el<HTMLSelectElement>("settings-channel-mode").value = userPrefs.channelDownloadMode ?? "single"
   modal.hidden = false
   setTimeout(() => el<HTMLInputElement>("settings-folder").focus(), 50)
 }
@@ -3789,6 +3846,8 @@ function saveSettingsModal(): void {
   const rawFolder = el<HTMLInputElement>("settings-folder").value.trim()
   const destination = el<HTMLSelectElement>("settings-destination")
     .value as Destination
+  const channelDownloadMode = el<HTMLSelectElement>("settings-channel-mode")
+    .value as "single" | "per-thread"
 
   if (!rawFolder) {
     setStatus("Settings: folder path cannot be empty.", "error")
@@ -3802,12 +3861,14 @@ function saveSettingsModal(): void {
 
   const changed =
     normalized !== userPrefs.oneDriveFolder ||
-    destination !== userPrefs.destination
+    destination !== userPrefs.destination ||
+    channelDownloadMode !== (userPrefs.channelDownloadMode ?? "single")
 
   userPrefs = {
     ...userPrefs,
     oneDriveFolder: normalized,
     destination,
+    channelDownloadMode,
   }
   saveUserPrefs(userCacheKey(), userPrefs)
   syncUserPrefsToUI()
