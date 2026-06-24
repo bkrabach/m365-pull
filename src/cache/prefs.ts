@@ -10,6 +10,7 @@ const KEY_PREFIX = "m365-pull.userPrefs.v1."
 const DEFAULTS: UserPrefs = {
   destination: "browser",
   oneDriveFolder: "/m365-pull/teams-chats",
+  channelDownloadMode: "single",
 }
 
 function keyFor(userKey: string): string {
@@ -31,6 +32,9 @@ export function loadUserPrefs(userKey: string): UserPrefs {
       ...(data.recordingMarkedInclude !== undefined ? { recordingMarkedInclude: data.recordingMarkedInclude } : {}),
       ...(data.includeMessages !== undefined ? { includeMessages: data.includeMessages } : {}),
       ...(data.includeRecordings !== undefined ? { includeRecordings: data.includeRecordings } : {}),
+      ...(data.viewMode !== undefined ? { viewMode: data.viewMode } : {}),
+      ...(data.selectedTeamIds !== undefined ? { selectedTeamIds: data.selectedTeamIds } : {}),
+      channelDownloadMode: data.channelDownloadMode ?? DEFAULTS.channelDownloadMode,
     }
   } catch {
     return { ...DEFAULTS }
