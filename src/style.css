@@ -543,7 +543,8 @@ header {
 }
 
 /* Recordings indicator in container rows (🎙 N) */
-.rec-indicator {
+.rec-indicator,
+.thread-indicator {
   flex-shrink: 0;
   font-size: 0.78rem;
   color: var(--muted);
@@ -1063,4 +1064,128 @@ header {
   background: #6b7280;
   border-color: #6b7280;
   color: white;
+}
+
+/* ===== Teams channel section (slice 2) ===== */
+
+/* Thread count badge: pending (dashed, dimmed) and resolved states */
+.thread-indicator.pending {
+  opacity: 0.45;
+  border-style: dashed;
+}
+
+/* Team group header — collapsible section divider above each team's channels.
+ * Promoted to a real styled header (was .channel-section-header, unstyled). */
+.team-group-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.4rem 1rem;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  list-style: none;
+  user-select: none;
+}
+
+.team-group-header.all-ignored {
+  opacity: 0.55;
+}
+
+.team-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapse toggle inside the team group header */
+.team-collapse-toggle {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 100ms, color 100ms, border-color 100ms;
+}
+.team-collapse-toggle:hover {
+  background: var(--row-hover);
+  color: var(--fg);
+  border-color: var(--border);
+}
+.team-collapse-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Channel status rows (loading / error / empty messages inside expanded rows) */
+.channel-status-row {
+  display: flex;
+  align-items: center;
+  padding: 0.35rem 1rem 0.35rem 3.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.channel-error-row {
+  color: var(--danger);
+}
+
+/* Channel tail row ("and more… — Download all") */
+.channel-tail-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.25rem 1rem 0.25rem 3.25rem;
+}
+
+.channel-tail-row .artifact-info {
+  flex: 1;
+}
+
+/* Team picker in §2 VIEW toolbar — chips for toggling which teams' channels appear. */
+.team-picker-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin-top: 0.15rem;
+}
+
+.team-picker-field .team-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+/* Quiet hint shown when no teams are selected yet. */
+.channel-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+  display: block;
+  margin-top: 0.2rem;
+  width: 100%;
+}
+
+.channel-tail-row .artifact-download {
+  /* Inherits .artifact-download chrome; override font size for the text label */
+  font-size: 0.78rem;
+  min-width: auto;
+  padding: 0 0.6rem;
 }

@@ -74,6 +74,12 @@ async function graphJson<T>(
 
 // ---- Public interfaces ----
 
+/** Lightweight team reference (id + displayName). */
+export interface TeamInfo {
+  id: string
+  displayName: string
+}
+
 /** Lightweight reference to a channel (no compound id). */
 export interface ChannelRef {
   teamId: string
@@ -137,25 +143,80 @@ interface GraphMessage {
 // ---- Public functions ----
 
 /**
+ * List all teams the signed-in user has joined.
+ * Cheap single call to /me/joinedTeams — use this to populate the team picker
+ * before fetching channels.
+ */
+export async function listTeams(
+  msal: PublicClientApplication,
+): Promise<TeamInfo[]> {
+  const page = await graphJson<{ value: GraphTeam[] }>(msal, "/me/joinedTeams", CHANNEL_SCOPES)
+  const teams = page.value ?? []
+  return teams.map((t) => ({ id: t.id, displayName: t.displayName }))
+}
+
+/**
+ * Fetch the last-activity timestamp for a single channel.
+ * Uses GET /teams/{teamId}/channels/{channelId}/messages?$top=1 (newest message
+ * first — the default ordering from Graph).  Returns the message's
+ * createdDateTime in ms since epoch, or null when the channel has no messages
+ * or the caller lacks access (403).
+ */
+export async function fetchChannelLastActivity(
+  msal: PublicClientApplication,
+  channel: ChannelRef,
+): Promise<number | null> {
+  const path =
+    `/teams/${channel.teamId}/channels/${channel.channelId}/messages?$top=1`
+  try {
+    const page = await graphJson<{ value: GraphMessage[] }>(msal, path, CHANNEL_SCOPES)
+    const msg = (page.value ?? [])[0]
+    if (!msg?.createdDateTime) return null
+    return new Date(msg.createdDateTime).getTime()
+  } catch (err) {
+    const msg = (err as Error).message ?? ""
+    if (/\b403\b/.test(msg) || /\bforbidden\b/i.test(msg) || /\baccess.?denied\b/i.test(msg)) {
+      return null // treat as no-access: sort last, don't loudly error
+    }
+    throw err
+  }
+}
+
+/**
  * List all channels the signed-in user has access to across their joined teams.
  * Returns containers sorted by teamName then channelName.
+ *
+ * @param options.teamIds  When provided, only channels from these team IDs are
+ *   fetched (used with the team picker to bound the cost).
  */
 export async function listChannels(
   msal: PublicClientApplication,
   options: {
+    teamIds?: string[]
     onProgress?: (note: string) => void
   } = {},
 ): Promise<ChannelContainer[]> {
-  const { onProgress } = options
+  const { onProgress, teamIds } = options
 
-  // 1. Fetch all joined teams.
-  onProgress?.("Fetching joined teams\u2026")
-  const teamsPage = await graphJson<{ value: GraphTeam[] }>(
-    msal,
-    "/me/joinedTeams",
-    CHANNEL_SCOPES,
-  )
-  const teams = teamsPage.value ?? []
+  // 1. Resolve the team list: use the caller-supplied set, or fetch all joined teams.
+  let teams: GraphTeam[]
+  if (teamIds && teamIds.length > 0) {
+    // Caller provided a filtered set — synthesize GraphTeam stubs so the rest of the
+    // function can proceed without an extra /me/joinedTeams call.
+    const idSet = new Set(teamIds)
+    // We still need displayNames; fetch just the joined-teams page once to get them.
+    onProgress?.("Fetching joined teams\u2026")
+    const teamsPage = await graphJson<{ value: GraphTeam[] }>(msal, "/me/joinedTeams", CHANNEL_SCOPES)
+    teams = (teamsPage.value ?? []).filter((t) => idSet.has(t.id))
+  } else {
+    onProgress?.("Fetching joined teams\u2026")
+    const teamsPage = await graphJson<{ value: GraphTeam[] }>(
+      msal,
+      "/me/joinedTeams",
+      CHANNEL_SCOPES,
+    )
+    teams = teamsPage.value ?? []
+  }
   onProgress?.(`Found ${teams.length} team(s). Listing channels\u2026`)
 
   // 2. For each team, fetch channels — ~4-way concurrency.
@@ -305,6 +366,74 @@ export async function fetchChannelThreadsInRange(
   }
 
   return { threads, truncated }
+}
+
+// ---- Preview fetch ----
+
+/** Result of a preview fetch: up to `top` threads + total in-window count. */
+export interface ChannelThreadPreviewResult {
+  /** First `top` threads (newest-first), ready to display. */
+  preview: ChannelThread[]
+  /** Total in-window threads found across the page budget (may be a lower bound when truncated). */
+  total: number
+  /** True when the page budget was exhausted; `total` is a lower bound, not the true count. */
+  truncated: boolean
+}
+
+/**
+ * Fetch a preview of in-window threads plus a total count, using a bounded page
+ * budget. Returns the first `top` threads as the preview and the count of ALL
+ * in-window threads found within the budget.
+ *
+ * Uses the same paginated pipe as fetchChannelThreadsInRange with `maxPages`
+ * capped at `maxCountPages` (default 5 = 250 messages max). When the budget
+ * runs out, `truncated` is true and `total` is a lower bound.
+ *
+ * 403 responses (private channel, no membership) are surfaced as a typed error
+ * with `.accessDenied = true` so callers can show "Access denied" rather than
+ * an empty count.
+ */
+export async function fetchChannelThreadPreview(
+  msal: PublicClientApplication,
+  channel: ChannelRef,
+  options: {
+    fromMs: number
+    toMs?: number
+    /** Max threads to return in the preview slice (default 5). */
+    top?: number
+    /** Max pages to fetch for counting (default 5). */
+    maxCountPages?: number
+  },
+): Promise<ChannelThreadPreviewResult> {
+  const { fromMs, toMs = Date.now(), top = 5, maxCountPages = 5 } = options
+
+  try {
+    // Reuse the full fetch with a page budget. threads arrive newest-last-activity
+    // first (API newest-first + early-stop), so the first `top` threads are the
+    // most recently active — perfect for a preview.
+    const result = await fetchChannelThreadsInRange(msal, channel, {
+      fromMs,
+      toMs,
+      maxPages: maxCountPages,
+    })
+    return {
+      preview: result.threads.slice(0, top),
+      total: result.threads.length,
+      truncated: result.truncated,
+    }
+  } catch (err) {
+    const msg = (err as Error).message ?? ""
+    // Surface 403 / Forbidden as a typed accessDenied error so the UI can show
+    // "Access denied" instead of a generic error or silence.
+    if (/\b403\b/.test(msg) || /\bforbidden\b/i.test(msg) || /\baccess.?denied\b/i.test(msg)) {
+      const e = new Error(`Access denied to channel \u201c${channel.channelName}\u201d`) as Error & {
+        accessDenied: true
+      }
+      ;(e as unknown as { accessDenied: boolean }).accessDenied = true
+      throw e
+    }
+    throw err
+  }
 }
 
 // ---- Internal utility ----

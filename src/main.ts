@@ -25,9 +25,14 @@ import { vttToMarkdown } from "./format/transcript-markdown"
 import { renderChatMarkdown } from "./format/chat-markdown"
 import { threadToMarkdown, buildThreadFilename } from "./format/channel-markdown"
 import {
+  listTeams,
   listChannels,
   fetchChannelThreadsInRange,
+  fetchChannelThreadPreview,
+  fetchChannelLastActivity,
+  type TeamInfo,
   type ChannelContainer,
+  type ChannelThread,
 } from "./sources/teams-channels"
 import { saveAsText } from "./destinations/browser"
 import { saveTextToOneDrive, getOneDriveFolderWebUrl } from "./destinations/onedrive"
@@ -108,6 +113,17 @@ interface RecordingsState {
   truncated: boolean
 }
 
+/** Per-channel preview state (lazy, fetched on first expand or favorite). */
+interface ChannelPreviewEntry {
+  status: "pending" | "loading" | "resolved" | "error"
+  preview: ChannelThread[]
+  total: number
+  truncated: boolean
+  errorMessage?: string
+  /** Window stamp when this entry was fetched; stale if != channelWindowStamp. */
+  windowStamp: number
+}
+
 type SortKey = "marked-first" | "recent" | "name"
 
 interface FilterState {
@@ -140,6 +156,21 @@ const SIGNIN_SCOPES = [
 let chatsState: ChatsState = { chats: [] }
 let recordingsState: RecordingsState = { containers: [], chatsScanned: 0, truncated: false }
 let channelsState: { containers: ChannelContainer[] } = { containers: [] }
+/** Per-channel preview state: keyed by channel composite id. Cleared on window change. */
+let channelPreviewMap: Map<string, ChannelPreviewEntry> = new Map()
+/** Channels currently expanded (ephemeral, not persisted). */
+const expandedChannelIds: Set<string> = new Set()
+/** Incremented whenever the date window changes; stale preview results are discarded. */
+let channelWindowStamp = 0
+/** Window used for channel preview fetches (same as recording window when both run). */
+let lastChannelWindow: { fromMs: number; toMs: number } | null = null
+/** All joined teams, populated by backgroundLoadChannels (Phase 1). Used by the team picker. */
+let availableTeams: TeamInfo[] = []
+/** Per-channel last-activity timestamp (ms). null = access denied / no messages.
+ * undefined (absent from map) = not yet resolved. Keyed by composite channel id. */
+const channelActivityMap: Map<string, number | null> = new Map()
+/** Matches channelWindowStamp — stale activity resolutions are discarded when they differ. */
+let channelActivityStamp = 0
 /** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
 let recordingsMap: Map<string, RecordingContainer> = new Map()
 /** True while the background recordings scan is running; rows show pending indicator. */
@@ -266,6 +297,17 @@ function getArtifactIds(chatId: string, recContainer: RecordingContainer | undef
 // `callId::filename` marks (those are dropped on migration).
 
 const REC_STREAM_SUFFIX = "::rec"
+/** Suffix for channel-stream favorite keys (e.g. `${teamId}::${channelId}::chan`).
+ * Distinct from `::rec` and from bare chatIds (which never contain `::`). */
+const CHAN_STREAM_SUFFIX = "::chan"
+
+function chanStreamKey(channelId: string): string {
+  return `${channelId}${CHAN_STREAM_SUFFIX}`
+}
+/** True when the channel (by composite id) has been favorited for sync. */
+function isChannelFavorited(channelId: string): boolean {
+  return markedIds.has(chanStreamKey(channelId))
+}
 
 /** localStorage key tracking whether the Phase 2 favorites migration has run. */
 function favMigrationKey(userKey: string): string {
@@ -918,6 +960,8 @@ function render(): void {
           <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
           <button class="chip" id="hide-downloaded">Hide downloaded</button>
           <button class="chip show-ignored" id="showignored" hidden>\u2298 Show ignored</button>
+          <!-- Team picker: populated by renderTeamPicker() after teams are enumerated -->
+          <div id="team-picker-field" class="field team-picker-field"></div>
         </div>
       </section>
 
@@ -1275,29 +1319,54 @@ function syncUIControlsFromState(): void {
 function rerenderContainerList(): void {
   const list = el<HTMLUListElement>("chats")
   const filtered = applyContainerFiltersAndSort(chatsState.chats)
-  if (chatsState.chats.length === 0) {
+
+  // Build the set of visible channel containers (from selected teams only).
+  const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
+  const q = filterState.search.trim().toLowerCase()
+  const visibleChannels: ChannelContainer[] = channelsState.containers.filter((c) => {
+    if (selectedTeamSet.size === 0 || !selectedTeamSet.has(c.teamId)) return false
+    const isIgnored = ignoredIds.has(c.id)
+    if (filterState.showIgnored) return isIgnored
+    if (isIgnored) return false
+    if (filterState.markedOnly && !isChannelFavorited(c.id)) return false
+    // Change #3: exclude channels outside the active window unless favorited or still resolving.
+    // Mirrors the "always include favorites" + date-window behavior used for chats.
+    if (!isChannelFavorited(c.id) && lastChannelWindow) {
+      const actMs = channelActivityMap.get(c.id)
+      if (actMs !== undefined) {
+        // Resolved: null = no messages / access denied; number = check window bounds.
+        if (actMs === null || actMs < lastChannelWindow.fromMs || actMs > lastChannelWindow.toMs) return false
+      }
+      // undefined = still resolving → keep (prevents flicker on first paint)
+    }
+    if (q && !("#" + c.channelName + " " + c.teamName).toLowerCase().includes(q)) return false
+    return true
+  })
+
+  if (chatsState.chats.length === 0 && channelsState.containers.length === 0) {
     list.innerHTML = ""
+    renderTeamPicker()
     return
   }
-  if (filtered.length === 0) {
+  if (filtered.length === 0 && visibleChannels.length === 0) {
     list.innerHTML = `<li class="empty">No containers match these filters. ${
       filterState.markedOnly
         ? "Favorite a chat\u2019s Messages or Recordings stream (expand a row) to add it here."
         : "Loosen the filters."
     }</li>`
   } else {
-    // Change 3: render grouped (chat rows that expand) or flat (every artifact
-    // its own top-level row). Both reuse the same artifact-row helpers, so
-    // Select / Download / Favorite behave identically across modes.
+    // Render grouped (chat rows that expand) or flat (every artifact its own
+    // top-level row). Channels are ONE row in both modes (no top-level explosion).
     const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
     if (viewMode === "flat") {
-      list.innerHTML = renderFlatArtifactRows(filtered)
+      list.innerHTML = renderFlatArtifactRows(filtered, visibleChannels)
     } else {
-      list.innerHTML = filtered
-        .map((c) => renderContainerRow(c, recordingsMap.get(c.id)))
-        .join("")
+      list.innerHTML = buildUnifiedGroupedHtml(filtered, visibleChannels)
     }
-    list.querySelectorAll<HTMLButtonElement>(".container-action").forEach((btn) => {
+    wireChannelListeners(list)
+    // Chat container-action (download). :not([data-channel-id]) excludes channel
+    // download buttons, which are already wired by wireChannelListeners above.
+    list.querySelectorAll<HTMLButtonElement>(".container-action:not([data-channel-id])").forEach((btn) => {
       btn.addEventListener("click", () => {
         const id = btn.dataset.chatId!
         const name = btn.dataset.chatName!
@@ -1307,7 +1376,9 @@ function rerenderContainerList(): void {
     // Change 1: per-artifact direct download (works in BOTH grouped & flat).
     // Reuses the exact primitives downloadSelectedArtifacts calls; the clicked
     // button shows its own progress/disabled state.
-    list.querySelectorAll<HTMLButtonElement>(".artifact-download").forEach((btn) => {
+    // :not([data-channel-id]) excludes channel thread-download buttons already
+    // handled by wireChannelListeners.
+    list.querySelectorAll<HTMLButtonElement>(".artifact-download:not([data-channel-id])").forEach((btn) => {
       btn.addEventListener("click", () => {
         if (btn.dataset.artKind === "recording") {
           const recId = btn.dataset.recId!
@@ -1320,7 +1391,8 @@ function rerenderContainerList(): void {
       })
     })
     // --- Phase 2: per-stream favorite toggles (live in the expanded view) ---
-    list.querySelectorAll<HTMLButtonElement>(".fav-toggle").forEach((btn) => {
+    // :not([data-stream="channel"]) excludes channel fav-toggles (already wired).
+    list.querySelectorAll<HTMLButtonElement>('.fav-toggle:not([data-stream="channel"])').forEach((btn) => {
       btn.addEventListener("click", () => {
         const chatId = btn.dataset.chatId!
         if (btn.dataset.stream === "recordings") {
@@ -1330,14 +1402,16 @@ function rerenderContainerList(): void {
         }
       })
     })
-    list.querySelectorAll<HTMLButtonElement>(".ignore-toggle").forEach((btn) => {
+    // :not([data-channel-id]) excludes channel ignore-toggles (already wired).
+    list.querySelectorAll<HTMLButtonElement>(".ignore-toggle:not([data-channel-id])").forEach((btn) => {
       btn.addEventListener("click", () => {
         toggleIgnore(btn.dataset.chatId!)
       })
     })
 
-    // --- Phase 1: expand/collapse ---
-    list.querySelectorAll<HTMLButtonElement>(".expand-toggle").forEach((btn) => {
+    // --- Phase 1: expand/collapse (chat rows only) ---
+    // :not(.channel-expand-toggle) excludes channel expand buttons (already wired).
+    list.querySelectorAll<HTMLButtonElement>(".expand-toggle:not(.channel-expand-toggle)").forEach((btn) => {
       btn.addEventListener("click", () => {
         const chatId = btn.dataset.chatId!
         const li = btn.closest<HTMLLIElement>("li.chat-row")
@@ -1361,10 +1435,13 @@ function rerenderContainerList(): void {
       })
     })
 
-    // --- Phase 1: select-all checkboxes (group level) ---
+    // --- Phase 1: select-all checkboxes (group level, chat rows only) ---
     list.querySelectorAll<HTMLInputElement>(".select-all-check").forEach((cb) => {
+      // Channel checkboxes carry data-channel-id instead of data-chat-id; they are
+      // wired separately by wireChannelListeners — skip them here.
+      if (!cb.dataset.chatId) return
       // Set indeterminate for "some but not all selected" — can't do via HTML attr
-      const chatId = cb.dataset.chatId!
+      const chatId = cb.dataset.chatId
       const rc = recordingsMap.get(chatId)
       const aids = getArtifactIds(chatId, rc)
       const selCount = aids.filter((id) => selectedArtifacts.has(id)).length
@@ -1391,7 +1468,10 @@ function rerenderContainerList(): void {
     })
 
     // --- Phase 1: individual artifact checkboxes ---
-    list.querySelectorAll<HTMLInputElement>(".artifact-check").forEach((cb) => {
+    // :not([data-channel-id]) excludes the flat channel checkbox (class artifact-check +
+    // channel-select-check, keyed by data-channel-id) which is already wired by
+    // wireChannelListeners via .channel-select-check.
+    list.querySelectorAll<HTMLInputElement>(".artifact-check:not([data-channel-id])").forEach((cb) => {
       cb.addEventListener("change", () => {
         const artifactId = cb.dataset.artifactId!
         const chatId = cb.closest<HTMLDivElement>(".artifact-row")?.dataset.chatId ?? ""
@@ -1422,8 +1502,7 @@ function rerenderContainerList(): void {
   updateContainerSummary(filtered.length)
   updateBulkButtons()
   updateSelectedButton()
-  // Append Teams channel rows after all chat rows (parallel track, own keys).
-  renderChannelRows()
+  renderTeamPicker()
 }
 
 /** Show/Clear-ignored controls render ONLY when there is something ignored.
@@ -1655,9 +1734,55 @@ function renderArtifactRows(
   return html
 }
 
+/** Build the grouped-mode unified HTML: chat rows + channel rows, sorted by the
+ * current filterState.sortKey.  Each chat produces one <li> row; each channel
+ * produces one <li> row (no top-level thread explosion). */
+function buildUnifiedGroupedHtml(
+  chats: TeamsChatItem[],
+  channels: ChannelContainer[],
+): string {
+  type Entry = { activityMs: number; favored: boolean; name: string; html: string }
+  const entries: Entry[] = []
+
+  for (const chat of chats) {
+    entries.push({
+      activityMs: chatActivityDate(chat),
+      favored: isChatFavorited(chat.id),
+      name: chatDisplayName(chat),
+      html: renderContainerRow(chat, recordingsMap.get(chat.id)),
+    })
+  }
+
+  const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+  for (const channel of channels) {
+    const activityMs = channelActivityMap.get(channel.id) ?? 0
+    entries.push({
+      activityMs,
+      favored: isChannelFavorited(channel.id),
+      name: "#" + channel.channelName,
+      html: renderChannelRowHtml(channel, channelPreviewMap.get(channel.id), viewMode),
+    })
+  }
+
+  if (filterState.sortKey === "name") {
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+  } else if (filterState.sortKey === "recent") {
+    entries.sort((a, b) => b.activityMs - a.activityMs)
+  } else {
+    // marked-first: favorites float up, then recent-desc
+    entries.sort((a, b) => {
+      if (a.favored !== b.favored) return a.favored ? -1 : 1
+      return b.activityMs - a.activityMs
+    })
+  }
+
+  return entries.map((e) => e.html).join("")
+}
+
 /** Render the FLAT view: every artifact as its own top-level <li> row, each
  * carrying its chat's name for identifiability. Reuses the same row helpers as
  * grouped mode so Select / Download / Favorite behave identically.
+ * Channel containers contribute ONE row each (not exploded into threads).
  *
  * When sort is "recent" (by date) we perform a GLOBAL sort across all artifacts
  * so that individual recordings from a recurring meeting interleave
@@ -1666,7 +1791,7 @@ function renderArtifactRows(
  * chats array is already correctly ordered at the container level, so we emit
  * artifacts in container order (which is the natural expected grouping for
  * those sort keys). */
-function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
+function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContainer[]): string {
   if (filterState.sortKey === "recent") {
     // Build every artifact with its own per-artifact sort timestamp, then sort
     // globally so e.g. 4 recordings of "Weekly Standup" from different weeks
@@ -1688,6 +1813,13 @@ function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
           })
         }
       }
+    }
+    // Channels: one row each, sorted by their resolved last-activity timestamp.
+    for (const channel of channels) {
+      items.push({
+        ms: channelActivityMap.get(channel.id) ?? 0,
+        html: renderChannelRowHtml(channel, channelPreviewMap.get(channel.id), "flat"),
+      })
     }
     items.sort((a, b) => b.ms - a.ms)
     return items.map((i) => i.html).join("")
@@ -1717,6 +1849,13 @@ function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
         }
       }
     }
+    for (const channel of channels) {
+      items.push({
+        fav: isChannelFavorited(channel.id),
+        ms: channelActivityMap.get(channel.id) ?? 0,
+        html: renderChannelRowHtml(channel, channelPreviewMap.get(channel.id), "flat"),
+      })
+    }
     // Two-key sort: favorited artifacts first (true before false), then date desc.
     items.sort((a, b) => {
       if (a.fav !== b.fav) return a.fav ? -1 : 1
@@ -1724,21 +1863,30 @@ function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
     })
     return items.map((i) => i.html).join("")
   }
-  // name: the chats array is already sorted at the container level; emit
-  // artifacts in container order so items from the same named container stay
-  // together (the natural expectation for name sort).
-  const parts: string[] = []
+  // name sort: collect chat blocks (artifacts cluster by container) + channel
+  // rows and sort the lot alphabetically by primary name.
+  const blocks: { name: string; html: string }[] = []
   for (const chat of chats) {
-    // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
-    if (loadIncludeMessages) parts.push(messagesArtifactRowHtml(chat, "flat"))
+    const chatHtmls: string[] = []
+    if (loadIncludeMessages) chatHtmls.push(messagesArtifactRowHtml(chat, "flat"))
     const rc = recordingsMap.get(chat.id)
     if (rc && rc.recordings.length > 0) {
       for (const rec of rc.recordings) {
-        parts.push(recordingArtifactRowHtml(chat, rec, "flat"))
+        chatHtmls.push(recordingArtifactRowHtml(chat, rec, "flat"))
       }
     }
+    if (chatHtmls.length > 0) {
+      blocks.push({ name: chatDisplayName(chat), html: chatHtmls.join("") })
+    }
   }
-  return parts.join("")
+  for (const channel of channels) {
+    blocks.push({
+      name: "#" + channel.channelName,
+      html: renderChannelRowHtml(channel, channelPreviewMap.get(channel.id), "flat"),
+    })
+  }
+  blocks.sort((a, b) => a.name.localeCompare(b.name))
+  return blocks.map((b) => b.html).join("")
 }
 
 /** Favoriting any stream clears the chat's ignored state (Favorite and Ignore
@@ -1776,6 +1924,47 @@ function toggleFavoriteRecordings(chatId: string): void {
   saveMarks(userCacheKey(), markedIds)
   rerenderContainerList()
   updateBulkButtons()
+  scheduleOneDriveSave()
+}
+
+/** Toggle the Favorite state of a channel stream (key = channelId::chan).
+ * Favoriting clears the channel's ignored state. Also triggers a lazy preview
+ * fetch so the 📬 count resolves immediately for a newly-favorited channel. */
+function toggleChannelFavorite(channelId: string): void {
+  const key = chanStreamKey(channelId)
+  if (markedIds.has(key)) {
+    markedIds.delete(key)
+  } else {
+    markedIds.add(key)
+    // Favoriting clears ignore (mutually exclusive)
+    if (ignoredIds.has(channelId)) {
+      ignoredIds.delete(channelId)
+      saveIgnored(userCacheKey(), ignoredIds)
+    }
+    // Eagerly fetch preview so the count resolves on favorite (spec requirement)
+    void ensureChannelPreview(channelId)
+  }
+  saveMarks(userCacheKey(), markedIds)
+  renderChannelSection()
+  updateBulkButtons()
+  scheduleOneDriveSave()
+}
+
+/** Toggle the ignored state for a channel. Ignoring clears any channel favorite. */
+function toggleChannelIgnore(channelId: string): void {
+  const wasIgnored = ignoredIds.has(channelId)
+  if (wasIgnored) {
+    ignoredIds.delete(channelId)
+  } else {
+    ignoredIds.add(channelId)
+    const key = chanStreamKey(channelId)
+    if (markedIds.has(key)) {
+      markedIds.delete(key)
+      saveMarks(userCacheKey(), markedIds)
+    }
+  }
+  saveIgnored(userCacheKey(), ignoredIds)
+  renderChannelSection()
   scheduleOneDriveSave()
 }
 
@@ -1997,6 +2186,10 @@ function reloadChatsWithCurrentSettings(): void {
   recordingsState = { containers: [], chatsScanned: 0, truncated: false }
   recordingsMap = new Map()
   channelsState = { containers: [] }
+  channelPreviewMap = new Map()
+  channelActivityMap.clear()
+  availableTeams = [] // force team re-enumeration on next load
+  channelWindowStamp++
   el<HTMLUListElement>("chats").innerHTML = ""
   void initialLoadChats()
 }
@@ -2194,23 +2387,25 @@ async function initialLoadChats(): Promise<void> {
     return
   }
 
+  // Compute the background-scan window once — shared by channels and recordings.
+  const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
+  const { cutoffMs: bgFromMs, untilMs: bgToMs } = computeChatWindow(range2, chatPrefs)
+
   // Build B: Recordings OFF => SKIP the recording scan entirely (real fetch savings).
   // The recordings checklist step was omitted in initLoadSteps, so just finalize the
   // load directly (backgroundLoadRecordings would normally call finalizeLoad).
   if (!loadIncludeRecordings) {
     rerenderContainerList() // messages-only list (no recording artifacts)
-    void backgroundLoadChannels()
+    void backgroundLoadChannels(bgFromMs, bgToMs)
     finalizeLoad()
     return
   }
 
-  // After chats load, start background channels and recordings scans using the
-  // same window. Channels run in parallel with recordings; neither gates the
-  // other. finalizeLoad() is called by backgroundLoadRecordings as before.
-  const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
-  const { cutoffMs: fromMs, untilMs: toMs } = computeChatWindow(range2, chatPrefs)
-  void backgroundLoadChannels()
-  void backgroundLoadRecordings(fromMs, toMs)
+  // After chats load, start background channels and recordings scans in parallel.
+  // Channels run in parallel with recordings; neither gates the other.
+  // finalizeLoad() is called by backgroundLoadRecordings as before.
+  void backgroundLoadChannels(bgFromMs, bgToMs)
+  void backgroundLoadRecordings(bgFromMs, bgToMs)
 }
 
 async function refreshChats(): Promise<void> {
@@ -2222,6 +2417,8 @@ async function refreshChats(): Promise<void> {
   recordingsState = { containers: [], chatsScanned: 0, truncated: false }
   recordingsMap = new Map()
   channelsState = { containers: [] }
+  channelPreviewMap = new Map()
+  channelWindowStamp++
   await initialLoadChats()
 }
 
@@ -2274,72 +2471,629 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
 
 // ----- Background channels load -----
 
-/** Fetch all joined teams + channels in the background; updates channelsState
- * and appends channel rows to the container list.  Does NOT call finalizeLoad()
- * so it can run in parallel with backgroundLoadRecordings. */
-async function backgroundLoadChannels(): Promise<void> {
-  updateLoadStep("channels", { state: "running", detail: "Listing channels\u2026", error: undefined })
+/** Load channels in three phases:
+ *
+ * 1. Enumerate all joined teams (cheap single call).  Populates availableTeams
+ *    and renders the team picker.  Skipped if teams were already enumerated in
+ *    this session.
+ *
+ * 2. Fetch channels for SELECTED teams only (bounded by the picker).  Empty
+ *    selection → skip entirely, show hint.
+ *
+ * 3. Resolve per-channel last-activity in a ~4-way concurrency pool so the
+ *    sub-lines and interleaved sort order fill in progressively.
+ *
+ * Does NOT call finalizeLoad() so it can run in parallel with
+ * backgroundLoadRecordings. */
+async function backgroundLoadChannels(fromMs: number, toMs: number): Promise<void> {
+  // Lock in the window and bump stamps so stale preview + activity results are discarded.
+  lastChannelWindow = { fromMs, toMs }
+  channelWindowStamp++
+  channelActivityStamp = channelWindowStamp
+  channelPreviewMap = new Map()
+  channelActivityMap.clear()
+  const stamp = channelWindowStamp
+
+  // ── Phase 1: Enumerate all joined teams (skip if already done) ─────────────
+  if (availableTeams.length === 0) {
+    updateLoadStep("channels", { state: "running", detail: "Listing teams\u2026", error: undefined })
+    try {
+      availableTeams = await listTeams(msal)
+    } catch (err) {
+      console.warn("[m365-pull] Team enumeration failed:", err)
+      availableTeams = []
+    }
+    if (channelWindowStamp !== stamp) return
+    renderTeamPicker()
+  }
+
+  // ── Phase 2: Enumerate channels for selected teams only ────────────────────
+  const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
+  const filteredTeams = availableTeams.filter((t) => selectedTeamSet.has(t.id))
+
+  let containers: ChannelContainer[] = []
+
+  if (filteredTeams.length === 0) {
+    // No teams selected — clear any prior channel state and show the hint.
+    channelsState.containers = []
+    updateLoadStep("channels", {
+      state: "done",
+      detail: `${availableTeams.length} team(s) available \u2014 pick teams in \u00a72 VIEW to include their channels`,
+    })
+    rerenderContainerList()
+    return
+  }
+
+  updateLoadStep("channels", {
+    state: "running",
+    detail: `Listing channels for ${filteredTeams.length} selected team(s)\u2026`,
+    error: undefined,
+  })
+
   try {
-    const containers = await listChannels(msal, {
+    containers = await listChannels(msal, {
+      teamIds: filteredTeams.map((t) => t.id),
       onProgress: (note) => {
         updateLoadStep("channels", { state: "running", detail: `Listing channels\u2026 ${note}` })
       },
     })
+    if (channelWindowStamp !== stamp) return
+
     channelsState.containers = containers
     updateLoadStep("channels", {
       state: "done",
-      detail: `Channels listed \u00b7 ${containers.length} channel${containers.length === 1 ? "" : "s"} across ${new Set(containers.map((c) => c.teamId)).size} team(s)`,
+      detail: `${containers.length} channel${containers.length === 1 ? "" : "s"} across ${filteredTeams.length} selected team(s)`,
     })
-    renderChannelRows()
+    rerenderContainerList()
   } catch (err) {
     console.warn("[m365-pull] Channels load failed:", err)
     updateLoadStep("channels", {
       state: "error",
       error: `Channels load failed: ${(err as Error).message}`,
     })
+    return
+  }
+
+  // ── Phase 3: Resolve per-channel last-activity (bounded concurrency) ────────
+  if (containers.length > 0 && channelActivityStamp === stamp) {
+    void resolveChannelActivities(containers, stamp)
   }
 }
 
-// ----- Render channel rows -----
+// ----- Channel preview helpers -----
 
-/** Append Teams channel rows (own section) after the chat rows in #chats.
- * Idempotent: removes any existing channel section before re-rendering.
- * Keyed by data-channel-id (NOT data-chat-id) to stay separate from chat machinery. */
-function renderChannelRows(): void {
-  const list = document.getElementById("chats") as HTMLUListElement | null
-  if (!list) return
+/** Resolve the active date window for channel preview fetches.
+ * Reuses the channel window set by backgroundLoadChannels; falls back to the
+ * same window computation used for chat loading. */
+function getChannelWindow(): { fromMs: number; toMs: number } {
+  if (lastChannelWindow) return lastChannelWindow
+  const range = userPrefs.chatRange ?? { kind: "last-7d" }
+  const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
+  return { fromMs: cutoffMs, toMs: untilMs }
+}
 
-  // Remove any prior channel section.
-  list.querySelectorAll(".channel-section-header, .channel-row").forEach((el) => el.remove())
+/** Fetch and cache the preview for a single channel (lazy, on expand or favorite).
+ * Race-safe: results from a superseded window stamp are silently discarded.
+ * Deduplication: a second call while a fetch is in flight is a no-op. */
+async function ensureChannelPreview(channelId: string): Promise<void> {
+  const stamp = channelWindowStamp
+  const existing = channelPreviewMap.get(channelId)
 
-  if (channelsState.containers.length === 0) return
+  // Deduplicate: already loading or resolved for the current window.
+  if (
+    existing &&
+    existing.windowStamp === stamp &&
+    (existing.status === "loading" || existing.status === "resolved")
+  ) {
+    return
+  }
 
-  const header = document.createElement("li")
-  header.className = "channel-section-header"
-  header.innerHTML = `<span>Channels (${channelsState.containers.length})</span>`
-  list.appendChild(header)
+  const container = channelsState.containers.find((c) => c.id === channelId)
+  if (!container) return
 
-  for (const c of channelsState.containers) {
-    const li = document.createElement("li")
-    li.className = "chat-row channel-row"
-    li.innerHTML = `
-      <div class="chat-row-header">
-        <div class="chat-info">
-          <div class="chat-name">${escapeHtml(c.channelName)}</div>
-          <div class="chat-sub">${escapeHtml(c.teamName)}</div>
+  channelPreviewMap.set(channelId, {
+    status: "loading",
+    preview: [],
+    total: 0,
+    truncated: false,
+    windowStamp: stamp,
+  })
+  renderChannelSection()
+
+  const { fromMs, toMs } = getChannelWindow()
+
+  try {
+    const result = await fetchChannelThreadPreview(msal, container, {
+      fromMs,
+      toMs,
+      top: 5,
+      maxCountPages: 5,
+    })
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    channelPreviewMap.set(channelId, {
+      status: "resolved",
+      preview: result.preview,
+      total: result.total,
+      truncated: result.truncated,
+      windowStamp: stamp,
+    })
+  } catch (err) {
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    const msg = (err as Error).message ?? ""
+    const isAccessDenied =
+      (err as { accessDenied?: boolean }).accessDenied === true ||
+      /\b403\b/.test(msg) ||
+      /\bforbidden\b/i.test(msg)
+    channelPreviewMap.set(channelId, {
+      status: "error",
+      preview: [],
+      total: 0,
+      truncated: false,
+      errorMessage: isAccessDenied ? "Access denied" : msg,
+      windowStamp: stamp,
+    })
+  }
+  renderChannelSection()
+}
+
+// ----- Channel row HTML helpers -----
+
+/** Collapsed-row favorite state glyph.
+ * Filled ★ (non-interactive) when favorited; invisible spacer otherwise.
+ * The interactive toggle lives inside the expanded group header. */
+/** Thread count badge: 📬 N when resolved, 📬 … (pending class) while loading. */
+function renderThreadIndicator(preview: ChannelPreviewEntry | undefined): string {
+  if (!preview || preview.status === "pending" || preview.status === "loading") {
+    return `<span class="thread-indicator pending" aria-label="Thread count loading">\uD83D\uDCEC \u2026</span>`
+  }
+  if (preview.status === "error") {
+    return "" // error is surfaced in the sub-line
+  }
+  const n = preview.total
+  const label = preview.truncated ? `${n}+` : String(n)
+  return `<span class="thread-indicator" title="${n} thread${n !== 1 ? "s" : ""} in window">\uD83D\uDCEC ${escapeHtml(label)}</span>`
+}
+
+/** Sub-line for a collapsed channel row.
+ * Format: "Channel · {teamName} · {activity} · {download-status}"
+ * activityMs: resolved timestamp (ms) | null (no messages/access denied) | undefined (still resolving) */
+function buildChannelSubLine(
+  channel: ChannelContainer,
+  preview: ChannelPreviewEntry | undefined,
+  activityMs: number | null | undefined,
+): string {
+  const lastSync = chatPrefs[channel.id]?.lastSync
+  const dlStatus = lastSync
+    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
+    : "Not downloaded yet"
+  if (preview?.status === "error") {
+    return `Channel \u00b7 ${channel.teamName} \u00b7 ${preview.errorMessage ?? "Error"}`
+  }
+  let activityLabel: string
+  if (activityMs === undefined) {
+    activityLabel = "resolving\u2026"
+  } else if (!activityMs) {
+    activityLabel = "last activity \u2014"
+  } else {
+    activityLabel = `last activity ${formatDate(new Date(activityMs).toISOString())}`
+  }
+  return `Channel \u00b7 ${channel.teamName} \u00b7 ${activityLabel} \u00b7 ${dlStatus}`
+}
+
+/** HTML for the expanded body of a channel row: group header + up to 5 preview
+ * thread rows + optional tail row.  Called from renderChannelSection. */
+function renderChannelThreadRows(
+  channel: ChannelContainer,
+  preview: ChannelPreviewEntry | undefined,
+): string {
+  const chanId = channel.id
+  const isFav = isChannelFavorited(chanId)
+
+  // Group header label (count only when resolved)
+  let countLabel = "Threads"
+  if (preview?.status === "resolved") {
+    const n = preview.total
+    const s = preview.truncated ? `${n}+` : String(n)
+    countLabel = `Threads (${s} in window)`
+  } else if (preview?.status === "loading") {
+    countLabel = "Threads (loading\u2026)"
+  }
+
+  // Interactive ★ lives here (expanded header) — status-only ★ is on the collapsed row.
+  let html = `
+    <div class="artifact-group-header" data-channel-id="${escapeHtml(chanId)}">
+      <button class="fav-toggle${isFav ? " favorited" : ""}"
+        data-stream="channel"
+        data-channel-id="${escapeHtml(chanId)}"
+        title="${isFav ? "Un-favorite this channel \u2014 threads won\u2019t be grabbed on every Sync" : "Favorite this channel \u2014 its threads are grabbed on every Sync"}"
+        aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}"
+        aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>
+      <span class="artifact-group-label">${escapeHtml(countLabel)}</span>
+    </div>
+  `
+
+  if (!preview || preview.status === "pending" || preview.status === "loading") {
+    html += `<div class="channel-status-row"><span>Loading threads\u2026</span></div>`
+    return html
+  }
+
+  if (preview.status === "error") {
+    const msg = preview.errorMessage ?? "Error loading threads"
+    html += `<div class="channel-status-row channel-error-row"><span>${escapeHtml(msg)}</span></div>`
+    return html
+  }
+
+  const threads = preview.preview
+  if (threads.length === 0) {
+    html += `<div class="channel-status-row"><span>No threads in window.</span></div>`
+    return html
+  }
+
+  for (const thread of threads) {
+    const dateStr = thread.createdDateTime ? formatDate(thread.createdDateTime) : "\u2014"
+    const replyCount = thread.replies.length
+    const subText = `${thread.author} \u00b7 ${dateStr} \u00b7 ${replyCount} repl${replyCount !== 1 ? "ies" : "y"}`
+    html += `
+      <div class="artifact-row" data-thread-root-id="${escapeHtml(thread.rootId)}" data-channel-id="${escapeHtml(chanId)}">
+        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
+        <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
+        <div class="artifact-info">
+          <div class="artifact-name">${escapeHtml(thread.subject)}</div>
+          <div class="artifact-sub">${escapeHtml(subText)}</div>
         </div>
-        <button class="container-action" data-channel-id="${escapeHtml(c.id)}" aria-label="Download channel ${escapeHtml(c.channelName)}">Download</button>
+        <button class="artifact-download channel-thread-download"
+          data-channel-id="${escapeHtml(chanId)}"
+          data-thread-root-id="${escapeHtml(thread.rootId)}"
+          title="Download this thread"
+          aria-label="Download thread: ${escapeHtml(thread.subject)}"><span aria-hidden="true">\u2b07</span></button>
       </div>
     `
-    // Wire up event: .container-action[data-channel-id] -> downloadChannel
-    const btn = li.querySelector<HTMLButtonElement>(".container-action[data-channel-id]")!
+  }
+
+  // Tail row when there are more than 5 threads in window.
+  // NO number in the label per spec ("and more…", not "and N more").
+  if (preview.total > 5 || preview.truncated) {
+    html += `
+      <div class="artifact-row channel-tail-row" data-channel-id="${escapeHtml(chanId)}">
+        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
+        <div class="artifact-info">
+          <div class="artifact-sub">and more\u2026</div>
+        </div>
+        <button class="artifact-download channel-download-all"
+          data-channel-id="${escapeHtml(chanId)}"
+          title="Download all threads in window"
+          aria-label="Download all threads in window"><span aria-hidden="true">\u2b07</span> Download all</button>
+      </div>
+    `
+  }
+
+  return html
+}
+
+// ----- Channel row HTML string builder -----
+
+/** Render a single channel container as an <li> HTML string.
+ * Used by buildUnifiedGroupedHtml and renderFlatArtifactRows so channel rows
+ * appear interleaved with chat rows in the main list.
+ *
+ * Event listeners are wired separately by wireChannelListeners() after innerHTML
+ * assignment (same pattern as chat rows in rerenderContainerList). */
+function renderChannelRowHtml(
+  channel: ChannelContainer,
+  preview: ChannelPreviewEntry | undefined,
+  viewMode: "grouped" | "flat",
+): string {
+  const channelId = channel.id
+  const isIgnored = ignoredIds.has(channelId)
+  const isFav = isChannelFavorited(channelId)
+  const activityMs = channelActivityMap.get(channelId)
+  // Selection key mirrors msg:/rec: convention: "chan:{channelId}"
+  const chanArtId = `chan:${channelId}`
+  const isSelected = selectedArtifacts.has(chanArtId)
+  const name = "#" + channel.channelName
+
+  if (viewMode === "flat") {
+    // Flat view: structurally matches messagesArtifactRowHtml("flat") —
+    // same artifact-row artifact-flat chrome, checkbox, inline fav-toggle, type icon,
+    // artifact-info columns, and ⬇ arrow download button.
+    // The fav-toggle is wired by wireChannelListeners (via [data-stream="channel"]).
+    // The download button (artifact-download + data-channel-id) is also wired there.
+    // The checkbox (channel-select-check) is wired by wireChannelListeners too.
+    const sub = buildChannelSubLine(channel, preview, activityMs)
+    return `
+    <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">
+      <input type="checkbox" class="artifact-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} aria-label="Select ${escapeHtml(name)} for bulk download">
+      <button class="fav-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel \u2014 always shown and synced on every Sync"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>
+      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
+      <div class="artifact-info">
+        <div class="artifact-name">${escapeHtml(name)}</div>
+        <div class="artifact-sub">${escapeHtml(sub)}</div>
+      </div>
+      <button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>
+    </li>
+  `
+  }
+
+  // Grouped view: keep the existing container chrome (matches renderContainerRow neighbours).
+  const isExpanded = expandedChannelIds.has(channelId)
+  return `
+    <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
+      <div class="chat-row-header">
+        <button class="expand-toggle channel-expand-toggle"
+          data-channel-id="${escapeHtml(channelId)}"
+          aria-expanded="${isExpanded ? "true" : "false"}"
+          title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
+        <input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">
+        <span class="fav-state${isFav ? " favorited" : ""}" title="${isFav ? "Favorited \u2014 expand to change" : "Not favorited \u2014 expand to favorite"}" aria-label="${isFav ? "Favorited" : "Not favorited"}">${isFav ? "\u2605" : "\u2606"}</span>
+        <div class="chat-info">
+          <div class="chat-name">${escapeHtml(name)}</div>
+          <div class="chat-sub">${escapeHtml(buildChannelSubLine(channel, preview, activityMs))}</div>
+        </div>
+        ${renderThreadIndicator(preview)}
+        <button class="ignore-toggle${isIgnored ? " ignored" : ""}"
+          data-channel-id="${escapeHtml(channelId)}"
+          title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}"
+          aria-label="${isIgnored ? "Un-ignore" : "Ignore"}"
+          aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
+        <button class="container-action"
+          data-channel-id="${escapeHtml(channelId)}"
+          aria-label="Download threads for ${escapeHtml(name)}">Download</button>
+      </div>
+      <div class="artifact-rows channel-artifact-rows"${isExpanded ? "" : " hidden"}>
+        ${renderChannelThreadRows(channel, preview)}
+      </div>
+    </li>
+  `
+}
+
+// ----- Channel event listener wiring -----
+
+/** Wire all channel-specific event listeners after innerHTML is set.
+ * Called by rerenderContainerList (same pattern as chat listener wiring). */
+function wireChannelListeners(list: HTMLUListElement): void {
+  const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+
+  // Expand/collapse (grouped mode only)
+  if (viewMode === "grouped") {
+    list.querySelectorAll<HTMLButtonElement>(".channel-expand-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const channelId = btn.dataset.channelId!
+        if (expandedChannelIds.has(channelId)) {
+          expandedChannelIds.delete(channelId)
+          rerenderContainerList()
+        } else {
+          expandedChannelIds.add(channelId)
+          rerenderContainerList()
+          void ensureChannelPreview(channelId)
+        }
+      })
+    })
+  }
+
+  // Channel select checkbox — adds/removes "chan:{channelId}" from selectedArtifacts,
+  // participating in the same "Download selected" bulk flow as chat artifacts.
+  list.querySelectorAll<HTMLInputElement>(".channel-select-check").forEach((cb) => {
+    const channelId = cb.dataset.channelId!
+    const artId = `chan:${channelId}`
+    cb.addEventListener("change", () => {
+      if (cb.checked) {
+        selectedArtifacts.add(artId)
+      } else {
+        selectedArtifacts.delete(artId)
+      }
+      updateSelectedButton()
+    })
+  })
+
+  // Interactive ★ toggle in expanded group header
+  list.querySelectorAll<HTMLButtonElement>(".fav-toggle[data-stream=\"channel\"]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const channelId = btn.dataset.channelId!
-      const container = channelsState.containers.find((x) => x.id === channelId)
-      if (!container) return
+      toggleChannelFavorite(btn.dataset.channelId!)
+    })
+  })
+
+  // Ignore toggle
+  list.querySelectorAll<HTMLButtonElement>(".ignore-toggle[data-channel-id]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      toggleChannelIgnore(btn.dataset.channelId!)
+    })
+  })
+
+  // Container-action (grouped view "Download" button)
+  list.querySelectorAll<HTMLButtonElement>(".container-action[data-channel-id]").forEach((btn) => {
+    const channelId = btn.dataset.channelId!
+    const container = channelsState.containers.find((c) => c.id === channelId)
+    if (!container) return
+    btn.addEventListener("click", () => {
       void downloadChannel(container, btn)
     })
-    list.appendChild(li)
+  })
+
+  // Flat-view ⬇ download button (.artifact-download + data-channel-id).
+  // The generic .artifact-download handler in rerenderContainerList excludes these
+  // via :not([data-channel-id]), so we wire them here instead.
+  list.querySelectorAll<HTMLButtonElement>(".artifact-download[data-channel-id]").forEach((btn) => {
+    const channelId = btn.dataset.channelId!
+    const container = channelsState.containers.find((c) => c.id === channelId)
+    if (!container) return
+    btn.addEventListener("click", () => {
+      void downloadChannel(container, btn)
+    })
+  })
+
+  // Per-thread download
+  list.querySelectorAll<HTMLButtonElement>(".channel-thread-download").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      void downloadChannelThread(btn.dataset.channelId!, btn.dataset.threadRootId!, btn)
+    })
+  })
+
+  // "Download all" in tail row
+  list.querySelectorAll<HTMLButtonElement>(".channel-download-all").forEach((btn) => {
+    const channelId = btn.dataset.channelId!
+    const container = channelsState.containers.find((c) => c.id === channelId)
+    if (!container) return
+    btn.addEventListener("click", () => {
+      const actionBtn =
+        list.querySelector<HTMLButtonElement>(
+          `.container-action[data-channel-id="${CSS.escape(channelId)}"]`,
+        ) ?? document.createElement("button")
+      void downloadChannel(container, actionBtn)
+    })
+  })
+}
+
+// ----- Team picker -----
+
+/** Render the team picker into #team-picker-field.
+ * Shows all joined teams as toggle chips; selected teams have class "active".
+ * Called after team enumeration completes, and on every rerenderContainerList. */
+function renderTeamPicker(): void {
+  const field = document.getElementById("team-picker-field")
+  if (!field) return
+
+  if (availableTeams.length === 0) {
+    field.innerHTML = ""
+    return
+  }
+
+  const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
+  const hasSelection = selectedTeamSet.size > 0
+
+  let html = `<span class="label">Teams\u00a0(channels):</span><span class="chips team-chips">`
+  for (const team of availableTeams) {
+    const active = selectedTeamSet.has(team.id)
+    html += `<button class="chip${active ? " active" : ""}" data-team-id="${escapeHtml(team.id)}" title="${escapeHtml(active ? `Deselect ${team.displayName}` : `Include channels from ${team.displayName}`)}">${escapeHtml(team.displayName)}</button>`
+  }
+  html += `</span>`
+
+  if (!hasSelection) {
+    html += `<span class="channel-hint">Pick a team above to include its channels in the list.</span>`
+  }
+
+  field.innerHTML = html
+
+  field.querySelectorAll<HTMLButtonElement>(".chip[data-team-id]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      handleTeamPickerChange(btn.dataset.teamId!, !btn.classList.contains("active"))
+    })
+  })
+}
+
+/** Toggle a team in/out of selectedTeamIds, persist, and reload channels. */
+function handleTeamPickerChange(teamId: string, selected: boolean): void {
+  const ids = new Set(userPrefs.selectedTeamIds ?? [])
+  if (selected) ids.add(teamId)
+  else ids.delete(teamId)
+  userPrefs = { ...userPrefs, selectedTeamIds: [...ids] }
+  saveUserPrefs(userCacheKey(), userPrefs)
+  // Immediate visual feedback — picker updates before the async channel load.
+  renderTeamPicker()
+  // Re-run channel loading for the new team selection (phases 2+3 only; teams
+  // are already in availableTeams so phase 1 is skipped).
+  if (lastChannelWindow) {
+    void backgroundLoadChannels(lastChannelWindow.fromMs, lastChannelWindow.toMs)
+  }
+}
+
+// ----- Channel activity resolution -----
+
+/** Resolve last-activity timestamps for a set of channel containers using a
+ * ~4-way concurrency pool.  Calls rerenderContainerList after each batch so
+ * the sub-line and sort order update progressively as activities resolve.
+ *
+ * Results from a superseded window stamp are silently discarded. */
+async function resolveChannelActivities(
+  containers: ChannelContainer[],
+  stamp: number,
+): Promise<void> {
+  const CONCURRENCY = 4
+  for (let i = 0; i < containers.length; i += CONCURRENCY) {
+    if (channelActivityStamp !== stamp) return
+    const batch = containers.slice(i, i + CONCURRENCY)
+    await Promise.all(
+      batch.map(async (container) => {
+        if (channelActivityStamp !== stamp) return
+        try {
+          const ms = await fetchChannelLastActivity(msal, container)
+          if (channelActivityStamp !== stamp) return
+          channelActivityMap.set(container.id, ms)
+        } catch (err) {
+          if (channelActivityStamp !== stamp) return
+          channelActivityMap.set(container.id, null)
+          console.warn(
+            `[m365-pull] Channel activity resolve failed for ${container.id}:`,
+            (err as Error).message,
+          )
+        }
+      }),
+    )
+    if (channelActivityStamp === stamp) rerenderContainerList()
+  }
+}
+
+// ----- Render channel section (compatibility shim) -----
+
+/** Compatibility shim: calls rerenderContainerList() so callers that predated
+ * the interleaved-list redesign continue to work without changes. */
+function renderChannelSection(): void {
+  rerenderContainerList()
+}
+
+// ----- Download channel thread (single) -----
+
+/** Download a single channel thread from the current preview cache.
+ * Uses the thread already loaded in channelPreviewMap (no extra network call). */
+async function downloadChannelThread(
+  channelId: string,
+  threadRootId: string,
+  button: HTMLButtonElement,
+): Promise<void> {
+  const container = channelsState.containers.find((c) => c.id === channelId)
+  if (!container) {
+    setStatus("Channel not found. Try reloading.", "error")
+    return
+  }
+  const previewEntry = channelPreviewMap.get(channelId)
+  const thread = previewEntry?.preview.find((t) => t.rootId === threadRootId)
+  if (!thread) {
+    setStatus("Thread not found \u2014 the window may have changed.", "error")
+    return
+  }
+  const originalLabel = button.textContent ?? "\u2b07"
+  button.disabled = true
+  button.textContent = "Saving\u2026"
+
+  const sourceLabel = `${container.teamName} / ${container.channelName}`
+  const filename = buildThreadFilename(thread, ".md")
+  const markdown = threadToMarkdown(thread, sourceLabel)
+
+  try {
+    let result: { saved: boolean; reason?: string }
+    if (userPrefs.destination === "onedrive") {
+      const baseFolder =
+        `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/channels/` +
+        `${sanitizeFilenameName(container.teamName)}/${sanitizeFilenameName(container.channelName)}`
+      result = await saveTextToOneDrive(msal, `${baseFolder}/${filename}`, markdown, "text/markdown")
+    } else {
+      result = await saveAsText(filename, markdown, {
+        extension: ".md",
+        description: "Markdown",
+        mimeType: "text/markdown",
+      })
+    }
+    if (result.saved) {
+      setStatus(`\u2713 Saved thread \u201c${thread.subject}\u201d from ${sourceLabel}.`)
+    } else if (result.reason === "cancelled") {
+      setStatus("Save cancelled.")
+    } else {
+      setStatus(`Save failed: ${result.reason ?? "unknown"}`, "error")
+    }
+  } catch (err) {
+    setStatus(`Error: ${(err as Error).message}`, "error")
+  } finally {
+    button.disabled = false
+    button.textContent = originalLabel
   }
 }
 
@@ -2355,8 +3109,9 @@ async function downloadChannel(
   button.disabled = true
   button.textContent = "Fetching\u2026"
 
-  // Resolve window: reuse the same window as the recordings scan (one source of truth).
-  const { fromMs, toMs } = lastRecordingWindow ??
+  // Resolve window: reuse the channel or recording window (both are set from the
+  // same computeChatWindow call in initialLoadChats).
+  const { fromMs, toMs } = lastChannelWindow ?? lastRecordingWindow ??
     (() => {
       const range = userPrefs.chatRange ?? { kind: "last-7d" }
       const { cutoffMs, untilMs } = computeChatWindow(range, chatPrefs)
@@ -2430,6 +3185,19 @@ async function downloadChannel(
     } else {
       setStatus(`\u2713 Saved ${saved} thread(s) for "${channelLabel}".${truncNote}`)
     }
+    // Track last-download timestamp (reuses chatPrefs keyed by channel composite id)
+    if (saved > 0) {
+      chatPrefs = {
+        ...chatPrefs,
+        [container.id]: {
+          ...(chatPrefs[container.id] ?? {}),
+          lastSync: new Date().toISOString(),
+        },
+      }
+      saveChatPrefs(userCacheKey(), chatPrefs)
+      scheduleOneDriveSave()
+      renderChannelSection()
+    }
   } catch (err) {
     setStatus(`Error: ${(err as Error).message}`, "error")
     console.error("[m365-pull] downloadChannel failed:", err)
@@ -2441,8 +3209,7 @@ async function downloadChannel(
 
 // ----- Bulk buttons -----
 
-/** Count favorited STREAMS among loaded chats (messages + recordings count
- * separately) and update the Sync-favorites button. */
+/** Count favorited STREAMS among loaded chats + favorited channels. */
 function countFavoritedStreams(): number {
   let n = 0
   for (const c of chatsState.chats) {
@@ -2450,6 +3217,10 @@ function countFavoritedStreams(): number {
     // "Sync favorites (N)" count matches what syncFavorites will actually pull.
     if (loadIncludeMessages && isMessagesFavorited(c.id)) n++
     if (loadIncludeRecordings && isRecordingsFavorited(c.id)) n++
+  }
+  // Favorited channels are always counted (independent of Messages/Recordings scope)
+  for (const c of channelsState.containers) {
+    if (isChannelFavorited(c.id)) n++
   }
   return n
 }
@@ -2875,6 +3646,7 @@ async function syncFavorites(): Promise<void> {
   type StreamTask =
     | { kind: "messages"; chat: TeamsChatItem }
     | { kind: "recordings"; chat: TeamsChatItem }
+    | { kind: "channel"; channel: ChannelContainer }
   const tasks: StreamTask[] = []
   for (const chat of chatsState.chats) {
     // Build B: only sync streams that are in the captured load scope, matching the
@@ -2882,6 +3654,10 @@ async function syncFavorites(): Promise<void> {
     // favorite is untouched (not deleted).
     if (loadIncludeMessages && isMessagesFavorited(chat.id)) tasks.push({ kind: "messages", chat })
     if (loadIncludeRecordings && isRecordingsFavorited(chat.id)) tasks.push({ kind: "recordings", chat })
+  }
+  // Favorited channels are always synced (independent of Messages/Recordings scope)
+  for (const channel of channelsState.containers) {
+    if (isChannelFavorited(channel.id)) tasks.push({ kind: "channel", channel })
   }
   if (tasks.length === 0) return
 
@@ -2893,17 +3669,20 @@ async function syncFavorites(): Promise<void> {
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i]
     bulkBtn.textContent = `Syncing ${i + 1}/${tasks.length}\u2026`
-    const rowBtn =
-      (document.querySelector(
-        `.container-action[data-chat-id="${CSS.escape(task.chat.id)}"]`,
-      ) as HTMLButtonElement | null) ?? document.createElement("button")
     if (task.kind === "messages") {
+      const rowBtn =
+        (document.querySelector(
+          `.container-action[data-chat-id="${CSS.escape(task.chat.id)}"]`,
+        ) as HTMLButtonElement | null) ?? document.createElement("button")
       const success = await downloadChat(task.chat.id, chatDisplayName(task.chat), rowBtn)
       if (success) ok++
       else fail++
-    } else {
-      // Recordings stream: pull every recording in this chat. downloadContainerTranscripts
-      // no-ops with a status if the chat has no (scanned) recordings.
+    } else if (task.kind === "recordings") {
+      const rowBtn =
+        (document.querySelector(
+          `.container-action[data-chat-id="${CSS.escape(task.chat.id)}"]`,
+        ) as HTMLButtonElement | null) ?? document.createElement("button")
+      // Recordings stream: pull every recording in this chat.
       const container =
         recordingsMap.get(task.chat.id) ??
         recordingsState.containers.find((c) => c.chatId === task.chat.id)
@@ -2911,6 +3690,18 @@ async function syncFavorites(): Promise<void> {
         await downloadContainerTranscripts(task.chat.id, rowBtn)
         ok++
       } else {
+        fail++
+      }
+    } else {
+      // Channel stream: download all in-window threads.
+      const rowBtn =
+        (document.querySelector(
+          `.container-action[data-channel-id="${CSS.escape(task.channel.id)}"]`,
+        ) as HTMLButtonElement | null) ?? document.createElement("button")
+      try {
+        await downloadChannel(task.channel, rowBtn)
+        ok++
+      } catch {
         fail++
       }
     }
@@ -2951,6 +3742,15 @@ async function downloadSelectedArtifacts(): Promise<void> {
       const recId = artifactId.slice(4)
       const outcome = await downloadRecordingTranscript(recId, tempBtn)
       if (outcome === "ok") ok++
+    } else if (artifactId.startsWith("chan:")) {
+      // Selected channel: download all threads in window via the same path as the
+      // per-row Download button.
+      const channelId = artifactId.slice(5)
+      const container = channelsState.containers.find((c) => c.id === channelId)
+      if (container) {
+        await downloadChannel(container, tempBtn)
+        ok++
+      }
     }
   }
 

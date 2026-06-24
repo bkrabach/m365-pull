@@ -58,6 +58,9 @@ export interface UserPrefs {
    * own top-level row; "grouped" = chat rows that expand into their artifacts.
    * When unset/undefined, the app resolves this to "flat". */
   viewMode?: "grouped" | "flat"
+  /** Team IDs whose channels are shown in the unified list.
+   * Default = [] (no channels shown until the user picks teams). */
+  selectedTeamIds?: string[]
 }
 
 export interface AppState {
