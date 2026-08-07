@@ -1,5 +1,7 @@
 import type { PublicClientApplication } from "@azure/msal-browser"
 
+import { isAllowedSharePointHost } from "./sharepoint-hosts"
+
 // Teams meeting recording transcripts via SharePoint REST API v2.1.
 //
 // Why this exists: /me/onlineMeetings and its transcript endpoints are
@@ -32,11 +34,19 @@ function urlToShareId(url: string): string {
 }
 
 function spHostFromUrl(url: string): string {
+  let host: string
   try {
-    return new URL(url).host
+    host = new URL(url).host
   } catch {
     throw new Error(`Not a valid URL: ${url}`)
   }
+  // Guard: only mint SharePoint-audience tokens for recognized SharePoint
+  // hosts. A crafted/corrupted URL must fail this item loudly, not become
+  // a token request for an arbitrary audience.
+  if (!isAllowedSharePointHost(host)) {
+    throw new UntrustedSharePointHostError(host)
+  }
+  return host
 }
 
 async function getGraphToken(
@@ -53,6 +63,12 @@ async function getSpToken(
   msal: PublicClientApplication,
   spHost: string,
 ): Promise<string> {
+  // Guard the mint site directly too: RecordingInfo.spHost normally comes
+  // from spHostFromUrl (already validated), but this is the last line of
+  // defense before MSAL requests a token for `https://{spHost}/.default`.
+  if (!isAllowedSharePointHost(spHost)) {
+    throw new UntrustedSharePointHostError(spHost)
+  }
   const account = msal.getActiveAccount()
   if (!account) throw new Error("No active account — sign in first.")
   // .default asks for whatever permissions are already consented to for
@@ -82,6 +98,18 @@ export interface RecordingInfo {
  * this tenancy" because this account can't resolve a foreign tenant's host.
  * The transcript simply isn't accessible via this account — it's not a real
  * failure, so callers should label and count it separately. */
+/** Thrown when a recording's URL points at a host that is not a recognized
+ * SharePoint host (see sharepoint-hosts.ts for the allowlist). We refuse to
+ * mint a SharePoint-audience token for it. Per-item: one bad URL fails that
+ * recording loudly; callers surface the message and continue with the rest. */
+export class UntrustedSharePointHostError extends Error {
+  readonly untrustedSharePointHost = true as const
+  constructor(host: string) {
+    super(`Unexpected SharePoint host: ${host} — refusing to request a token for it`)
+    this.name = "UntrustedSharePointHostError"
+  }
+}
+
 export class CrossTenantRecordingError extends Error {
   readonly crossTenant = true as const
   constructor(
