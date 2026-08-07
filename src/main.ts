@@ -915,7 +915,7 @@ function render(): void {
           <label class="form-field">
             <span class="form-label">Default destination</span>
             <select id="settings-destination" class="form-input">
-              <option value="browser">Browser (save dialog)</option>
+              <option value="browser">Browser (downloads folder)</option>
               <option value="onedrive">OneDrive folder</option>
             </select>
             <span class="form-help">Where to save downloads by default. You can override this from the main action row.</span>
@@ -1014,7 +1014,7 @@ function render(): void {
           <span class="field">
             <span class="label">Destination:</span>
             <select id="destination" title="Where to save downloads">
-              <option value="browser">Browser (save dialog)</option>
+              <option value="browser">Browser (downloads folder)</option>
               <option value="onedrive">OneDrive folder</option>
             </select>
             <span class="onedrive-folder" id="onedrive-folder" hidden>
@@ -3628,10 +3628,17 @@ async function downloadChat(
       )
       return false
     } else {
+      // Log as well as show: in bulk mode the run summary overwrites the status
+      // line, so without this the real reason is destroyed before it can be read.
+      console.error(
+        `[m365-pull] downloadChat save failed for "${chatName}" (${chatId}):`,
+        result.reason,
+      )
       setStatus(`Save failed: ${result.reason}`, "error")
       return false
     }
   } catch (err) {
+    console.error(`[m365-pull] downloadChat failed for "${chatName}" (${chatId}):`, err)
     setStatus(`Error: ${(err as Error).message}`, "error")
     return false
   } finally {
