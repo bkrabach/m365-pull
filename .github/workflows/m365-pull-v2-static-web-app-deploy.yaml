@@ -10,8 +10,17 @@ on:
     branches:
       - main
 
+# DO NOT "simplify" this to just github.ref. See docs/DEPLOYMENT_NOTES.md #1.
+# For a pull_request event with action=closed, github.ref resolves to the BASE branch
+# (refs/heads/main), not refs/pull/N/merge. Merging a PR fires both a push->main event
+# and a pull_request closed event ~1s apart, so with a github.ref-only key they land in
+# the SAME concurrency group, and cancel-in-progress makes the close run kill the
+# production deploy before it reaches a runner. The close run deploys nothing (its
+# build_and_deploy_job is skipped by the if: guard) — it only tears down the PR preview.
+# Including github.event_name keeps push deploys in their own group; keying PRs by
+# pull_request.number keeps a close run able to cancel only builds of its OWN PR.
 concurrency:
-  group: deploy-swa-${{ github.ref }}
+  group: deploy-swa-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
