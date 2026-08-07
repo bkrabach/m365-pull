@@ -88,6 +88,9 @@ export interface RecordingsResult {
   chatsScanned: number
   /** True if we hit the chat-paging cap and there may be more chats unread. */
   truncated: boolean
+  /** Number of chats skipped because the user is not a roster member (403
+   * AclCheckFailed). Permanent, expected condition -- not a failure. */
+  inaccessibleChats: number
 }
 
 interface ChatListItem {
@@ -176,6 +179,16 @@ function isConsentError(err: unknown): boolean {
   return /AADSTS65001|invalid_grant|InteractionRequiredAuthError/i.test(hay)
 }
 
+/** True when an error is Graph refusing message access because the caller
+ * isn't a roster member of a meeting chat (403 AclCheckFailed). This is a
+ * permanent, expected condition -- the chat is visible in /me/chats but the
+ * user was never added to its roster, so Graph correctly denies message
+ * reads. It will never succeed on retry and is not a scan failure. */
+function isAccessDeniedError(err: unknown): boolean {
+  const hay = `${err instanceof Error ? err.message : ""} ${String(err)}`
+  return /\b403\b|forbidden|insufficientprivileges|aclcheckfailed|accessdenied/i.test(hay)
+}
+
 /** Graph GET with retry: honors Retry-After on 429, exponential backoff on
  * 502/503/504. Up to 5 retries before throwing. Refreshes token each attempt
  * so stale tokens don't block long-running paginated scans. */
@@ -236,9 +249,11 @@ export interface ListRecordingsOptions {
  * Discover all call recordings the user has access to within [fromMs, toMs].
  *
  * Algorithm:
- *   1. Page through /me/chats. Stop early once the oldest chat in a page is
- *      older than fromMs (chats are returned by lastUpdatedDateTime desc).
- *   2. Filter to chats whose lastUpdatedDateTime >= fromMs.
+ *   1. Page through /me/chats fully (cursor exhaustion or hard page cap --
+ *      NOT an ordering-dependent early stop; /me/chats is not reliably
+ *      sorted by lastUpdatedDateTime, see comment at the loop below).
+ *   2. Filter to chats whose lastUpdatedDateTime >= fromMs (with an
+ *      inclusion-biased skew margin -- see comment at the filter below).
  *   3. For each such chat, page through messages (newest-first) until
  *      createdDateTime < fromMs (window edge) or the per-chat page cap is hit.
  *      If the cap fires before the edge, container.truncated = true.
@@ -262,13 +277,28 @@ export async function listRecordings(
   const {
     fromMs,
     toMs,
-    maxChatPages = 10,
+    maxChatPages = 60,
     maxMsgPagesPerChat = 30,
     onProgress,
   } = options
   const untilMs = toMs ?? Date.now()
 
-  // Phase 1: page through chats (unchanged from prior implementation)
+  // Phase 1: page through chats.
+  //
+  // IMPORTANT -- do NOT reintroduce an ordering-dependent early stop here.
+  // Measured live against this tenant: /me/chats is NOT sorted by
+  // lastUpdatedDateTime descending. Page 1's oldest item was
+  // 2026-05-05T13:42:36 while page 2 then opened at 2026-08-07T01:48:07 --
+  // newer than page 1's last entry, i.e. non-monotonic. A "stop once this
+  // page's oldest item predates the window" heuristic breaks after a single
+  // page and silently misses everything deeper in the cursor -- including
+  // chats with genuine in-window recordings (recording events don't bump
+  // lastUpdatedDateTime; see the recentChats filter below). Some pages also
+  // carry the .NET null-date sentinel "0001-01-01T00:00:00" for
+  // lastUpdatedDateTime, which parses to a valid (hugely negative) number
+  // and would silently poison any "oldest on this page" computation. The
+  // only correct stop conditions are cursor exhaustion (@odata.nextLink is
+  // null) or the hard page cap below.
   let chatsPath: string | null = "/me/chats?$top=50"
   const allChats: ChatListItem[] = []
   let chatPages = 0
@@ -277,16 +307,34 @@ export async function listRecordings(
     const page: { value: ChatListItem[]; "@odata.nextLink"?: string } =
       await graphJson(msal, chatsPath, SCOPES)
     allChats.push(...page.value)
-    const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
-    if (oldest && new Date(oldest).getTime() < fromMs) break
     chatsPath = page["@odata.nextLink"] ?? null
     chatPages++
   }
+  // truncated: cursor still had more pages queued when the cap fired.
+  // Default raised 10 -> 60: the sibling chat-listing loop in main.ts
+  // needed 60+ pages against this same tenant and STILL had
+  // @odata.nextLink pending after that, so a cap of 10 was drastically
+  // short for real-world chat volume. Never let a capped scan look
+  // complete -- this flag is propagated to the caller unchanged below.
   const truncated = chatsPath !== null && chatPages >= maxChatPages
 
+  // Fail toward INCLUSION, not exclusion. Two measured failure modes:
+  //   (a) lastUpdatedDateTime missing, unparseable, or the .NET year-1
+  //       sentinel "0001-01-01T00:00:00" (parses to a valid but hugely
+  //       negative timestamp) -- must not silently drop the chat.
+  //   (b) recording events do NOT bump lastUpdatedDateTime. Measured:
+  //       "Amplifier Releases Shareout" has lastUpdatedDateTime =
+  //       2026-08-06T18:31:33 but its recording event fired at
+  //       2026-08-06T22:02:57 -- 3.5h later. A hard ">= fromMs" cutoff
+  //       would wrongly exclude a chat whose only in-window activity is a
+  //       recording, before it's ever scanned. Use a generous skew margin
+  //       instead of an exact cutoff.
+  const RECENT_CHAT_SKEW_MS = 3 * 24 * 60 * 60 * 1000 // 3 days
   const recentChats = allChats.filter((c) => {
-    if (!c.lastUpdatedDateTime) return false
-    return new Date(c.lastUpdatedDateTime).getTime() >= fromMs
+    if (!c.lastUpdatedDateTime) return true
+    const t = new Date(c.lastUpdatedDateTime).getTime()
+    if (Number.isNaN(t) || t <= 0) return true // unparseable or 0001-01-01 sentinel
+    return t >= fromMs - RECENT_CHAT_SKEW_MS
   })
 
   // Phase 2: deep message scan -- paginate each chat until window edge or cap.
@@ -295,6 +343,7 @@ export async function listRecordings(
   const participantsByCallId = new Map<string, Participant[]>()
   const chatTruncatedSet = new Set<string>()
   let progressDone = 0
+  let inaccessibleChatCount = 0
 
   async function scanChat(chat: ChatListItem): Promise<void> {
     let msgPath: string | null =
@@ -370,8 +419,21 @@ export async function listRecordings(
         chatTruncatedSet.add(chat.id)
       }
     } catch (err) {
-      // Bad chat shouldn't kill the whole scan. Log and continue.
-      console.warn(`[m365-pull] Failed to scan chat ${chat.id}:`, err)
+      // Access-denied (403 AclCheckFailed) is a permanent, expected condition:
+      // the chat is visible in /me/chats but the user isn't a roster member,
+      // so Graph correctly refuses message reads. It will never succeed on
+      // retry -- log it quietly (no stack trace) and count it, rather than
+      // screaming a full error for normal operation. Every other failure
+      // keeps the loud console.error + stack -- those ARE unexpected.
+      if (isAccessDeniedError(err)) {
+        inaccessibleChatCount++
+        console.debug(
+          `[m365-pull] No roster access to chat ${chat.id} -- skipped.`,
+        )
+      } else {
+        // Bad chat shouldn't kill the whole scan. Log and continue.
+        console.error(`[m365-pull] Failed to scan chat ${chat.id}:`, err)
+      }
     } finally {
       progressDone++
       onProgress?.(
@@ -502,6 +564,7 @@ export async function listRecordings(
     containers,
     chatsScanned: recentChats.length,
     truncated,
+    inaccessibleChats: inaccessibleChatCount,
   }
 }
 

@@ -396,20 +396,54 @@ function migrateMarksToStreams(marks: Set<string>): boolean {
  * carries the discriminator \u2014 we match the substring "call" case-insensitively.
  *
  * Defensive: returns false when `eventDetail`/`@odata.type` is absent, so a
- * chat with no usable discriminator degrades to the createdDateTime sentinel
- * (current behaviour \u2014 never crashes, never falsely counts roster churn). */
+ * chat with no usable discriminator falls through to the next tier of
+ * chatActivityDate() (chat.lastUpdatedDateTime, then chat.createdDateTime)
+ * \u2014 never crashes, never falsely counts roster churn as real message
+ * activity. */
 function isCallActivityEvent(preview: TeamsChatItem["lastMessagePreview"]): boolean {
   const odataType = preview?.eventDetail?.["@odata.type"]
   return typeof odataType === "string" && odataType.toLowerCase().includes("call")
 }
 
-/** Derive the "last real conversation activity" timestamp (ms) for a chat. */
+/** Derive the "last real conversation activity" timestamp (ms) for a chat.
+ *
+ * Precedence:
+ *   1. `lastMessagePreview.createdDateTime` \u2014 but ONLY when the preview is
+ *      a real message (`messageType === "message"`) or a call-activity event
+ *      (see isCallActivityEvent). This is the phantom-activity filter: Graph
+ *      also stamps this slot for roster/membership-churn system events
+ *      (members added/removed, renamed, pinned, meeting-policy changes,
+ *      app-installed, \u2026), which are NOT real conversation activity and
+ *      must not be trusted as the activity date.
+ *   2. `chat.lastUpdatedDateTime` \u2014 Graph's own "something happened here"
+ *      field (non-optional on TeamsChatItem). Used whenever tier 1 doesn't
+ *      apply (no preview, or a preview that isn't a real message/call
+ *      event), and parsed defensively: an unparseable/missing value (NaN)
+ *      falls through to tier 3 rather than being trusted.
+ *   3. `chat.createdDateTime` \u2014 last resort, when the chat was created.
+ *      This was the ONLY fallback previously: for a long-lived recurring
+ *      meeting chat this can be weeks or months stale, which silently
+ *      excludes the chat (and its recordings) from any narrow date-window
+ *      filter.
+ *
+ * Trade-off (deliberate): tier 2 means some roster-churn/phantom-activity
+ * chats will now appear inside the active window purely because Graph
+ * bumped lastUpdatedDateTime for a non-message event. That's an acceptable
+ * cost \u2014 over-inclusion is visible (an extra row the user can ignore)
+ * and harmless, whereas under-inclusion (the original bug) silently drops
+ * real meeting chats and their recordings with zero signal to the user. */
 function chatActivityDate(chat: TeamsChatItem): number {
   const preview = chat.lastMessagePreview
   const isRealMessage = preview?.messageType === "message"
   if ((isRealMessage || isCallActivityEvent(preview)) && preview?.createdDateTime) {
     return new Date(preview.createdDateTime).getTime()
   }
+  // NOTE: do NOT fall back to chat.lastUpdatedDateTime here. Verified against live
+  // Graph data (2026-08-06): the tenant bumps lastUpdatedDateTime on hundreds of
+  // dormant chats whose last real message was 2020-2023 (33 of 100 sampled had a
+  // NULL lastMessagePreview; 31 more had preview dates years old). Using it as an
+  // activity proxy inflated a 8-chat day into 123 rows of junk. lastMessagePreview
+  // is the only field that tracks genuine conversation.
   return new Date(chat.createdDateTime).getTime()
 }
 
@@ -1742,9 +1776,52 @@ function renderArtifactRows(
   return html
 }
 
+/** Recording containers whose owning chat is NOT among the currently rendered
+ * `chats` \u2014 i.e. chatActivityDate() placed the chat outside the active
+ * window (or it was otherwise filtered out) even though the recordings
+ * scanner's own, looser fromMs-only filter (teams-call-recordings.ts) still
+ * picked up its recordings as in-window. Rather than silently dropping these
+ * recordings at render (the original bug), they're surfaced as "orphans" \u2014
+ * a fail-loud safety net. Excludes empty containers (nothing to render). */
+function getOrphanRecordingContainers(chats: TeamsChatItem[]): RecordingContainer[] {
+  const chatIds = new Set(chats.map((c) => c.id))
+  return [...recordingsMap.values()].filter(
+    (c) => !chatIds.has(c.chatId) && c.recordings.length > 0,
+  )
+}
+
+/** Build a minimal TeamsChatItem stand-in for an orphan recording container
+ * (see getOrphanRecordingContainers) so it can be rendered through the exact
+ * same row builders (chatDisplayName / recordingArtifactRowHtml) real chats
+ * use \u2014 no bespoke markup or naming logic. Members are derived from the
+ * container's own recording participants, so chatDisplayName() resolves a
+ * sensible name (chat topic, "with <person>" for 1:1s, etc.) purely from data
+ * the recordings scanner already collected \u2014 it never crashes or renders
+ * blank even when topic/participants are missing (chatDisplayName degrades to
+ * "(unnamed chat)"/"(meeting chat)" on its own). */
+function orphanChatStub(container: RecordingContainer): TeamsChatItem {
+  const firstRec = container.recordings[0]
+  const members = (firstRec?.participants ?? [])
+    .filter((p) => p.kind === "user")
+    .map((p) => ({ displayName: p.displayName }))
+  const fallbackDate = firstRec?.eventCreatedDateTime ?? new Date(0).toISOString()
+  return {
+    id: container.chatId,
+    topic: container.chatTopic,
+    chatType: container.chatType,
+    createdDateTime: fallbackDate,
+    lastUpdatedDateTime: fallbackDate,
+    webUrl: "",
+    members,
+  }
+}
+
 /** Build the grouped-mode unified HTML: chat rows + channel rows, sorted by the
  * current filterState.sortKey.  Each chat produces one <li> row; each channel
- * produces one <li> row (no top-level thread explosion). */
+ * produces one <li> row (no top-level thread explosion). Orphan recordings
+ * (see getOrphanRecordingContainers) each contribute their own flat-style
+ * artifact row \u2014 there's no real chat row to nest them under \u2014 and
+ * participate in the exact same sort as everything else. */
 function buildUnifiedGroupedHtml(
   chats: TeamsChatItem[],
   channels: ChannelContainer[],
@@ -1759,6 +1836,22 @@ function buildUnifiedGroupedHtml(
       name: chatDisplayName(chat),
       html: renderContainerRow(chat, recordingsMap.get(chat.id)),
     })
+  }
+
+  // Orphan recordings (chat excluded by the window filter, recording itself
+  // real) \u2014 one entry per recording so each sorts to its own chronological
+  // position rather than clustering at the end.
+  for (const container of getOrphanRecordingContainers(chats)) {
+    const stub = orphanChatStub(container)
+    const name = chatDisplayName(stub)
+    for (const rec of container.recordings) {
+      entries.push({
+        activityMs: new Date(rec.eventCreatedDateTime).getTime(),
+        favored: isRecordingsFavorited(container.chatId),
+        name,
+        html: recordingArtifactRowHtml(stub, rec, "flat"),
+      })
+    }
   }
 
   const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
@@ -1822,6 +1915,17 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
         }
       }
     }
+    // Orphan recordings (chat excluded by the window filter, recording itself
+    // real) \u2014 sort into the global timeline by their own event date.
+    for (const container of getOrphanRecordingContainers(chats)) {
+      const stub = orphanChatStub(container)
+      for (const rec of container.recordings) {
+        items.push({
+          ms: new Date(rec.eventCreatedDateTime).getTime(),
+          html: recordingArtifactRowHtml(stub, rec, "flat"),
+        })
+      }
+    }
     // Channels: one row each, sorted by their resolved last-activity timestamp.
     for (const channel of channels) {
       items.push({
@@ -1857,6 +1961,18 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
         }
       }
     }
+    // Orphan recordings (chat excluded by the window filter, recording itself
+    // real) \u2014 same per-stream favorite key and per-artifact date as above.
+    for (const container of getOrphanRecordingContainers(chats)) {
+      const stub = orphanChatStub(container)
+      for (const rec of container.recordings) {
+        items.push({
+          fav: isRecordingsFavorited(container.chatId),
+          ms: new Date(rec.eventCreatedDateTime).getTime(),
+          html: recordingArtifactRowHtml(stub, rec, "flat"),
+        })
+      }
+    }
     for (const channel of channels) {
       items.push({
         fav: isChannelFavorited(channel.id),
@@ -1886,6 +2002,15 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
     if (chatHtmls.length > 0) {
       blocks.push({ name: chatDisplayName(chat), html: chatHtmls.join("") })
     }
+  }
+  // Orphan recordings (chat excluded by the window filter, recording itself
+  // real) \u2014 one block per orphaned chat, sorted alphabetically like everything else.
+  for (const container of getOrphanRecordingContainers(chats)) {
+    const stub = orphanChatStub(container)
+    const chatHtmls = container.recordings.map((rec) =>
+      recordingArtifactRowHtml(stub, rec, "flat"),
+    )
+    blocks.push({ name: chatDisplayName(stub), html: chatHtmls.join("") })
   }
   for (const channel of channels) {
     blocks.push({
@@ -2290,8 +2415,10 @@ async function initialLoadChats(): Promise<void> {
 
   const kept: TeamsChatItem[] = []
   let cursor: string | null = null
-  let consecutiveOutOfWindowPages = 0
-  const PAGE_HARD_CAP = 30
+  // Graph returns ~25 chats per page for this query (despite $top=50), so this cap is
+  // ~1500 chats. It is a runaway backstop only -- normal termination is cursor
+  // exhaustion. Hitting it is reported loudly (see hardCapNote below).
+  const PAGE_HARD_CAP = 60
 
   try {
     let pageCount = 0
@@ -2305,25 +2432,54 @@ async function initialLoadChats(): Promise<void> {
         return t >= cutoffMs && t <= untilMs
       })
 
-      const allBelowCutoff = page.chats.every(
-        (c) => chatActivityDate(c) < cutoffMs,
-      )
-
+      // STOP CONDITION \u2014 must key off Graph's ACTUAL SORT KEY, not the filter field.
+      // `/me/chats` is sorted by `lastUpdatedDateTime` DESC, but `chatActivityDate()`
+      // (used for the in-window filter above) reads `lastMessagePreview.createdDateTime`.
+      // These are DIFFERENT FIELDS and they diverge badly in this tenant:
+      //   - call-recording events don't bump `lastUpdatedDateTime`, so a chat's real
+      //     activity can be newer than its sort key (verified skew: ~3.5h)
+      //   - the tenant also bumps `lastUpdatedDateTime` on hundreds of dormant chats
+      //     (missing or years-old preview), flooding the TOP of the sort order with
+      //     phantom-bumped dead chats
+      // Using chatActivityDate() as the stop signal made a page of phantom-bumped dormant
+      // chats look "all below cutoff" and tripped the early-break before real meeting
+      // chats further down the (correctly sorted) list were ever fetched. Because pages
+      // arrive sorted by lastUpdatedDateTime descending, once a page's OLDEST
+      // lastUpdatedDateTime is older than the window start (minus skew margin), no later
+      // page can contain a chat with a newer lastUpdatedDateTime \u2014 that's the only
+      // safe place to stop. Do NOT "optimize" this back to chatActivityDate().
+      // There is deliberately NO early-stop heuristic here. Two facts, both measured
+      // against live Graph data (2026-08-06), rule one out entirely:
+      //
+      //   1. `/me/chats` is NOT sorted by lastUpdatedDateTime descending. Observed:
+      //      page 1 reached back to 2026-05-05 while page 2 opened at 2026-08-07.
+      //      Because ordering gives no monotonic guarantee, the content of the current
+      //      page tells you NOTHING about what later pages contain.
+      //   2. Some chats carry lastUpdatedDateTime = "0001-01-01T00:00:00" (the .NET
+      //      null-date sentinel). It parses to a valid, hugely-negative timestamp, so
+      //      an isNaN() guard does not catch it, and a single such chat poisons any
+      //      Math.min() over the page.
+      //
+      // A prior version stopped after 2 consecutive "all below cutoff" pages and
+      // silently dropped real meeting chats that lived on page 6+. Paginate until the
+      // cursor is exhausted; PAGE_HARD_CAP is the only backstop, and hitting it is
+      // reported loudly below. Do NOT reintroduce a page-content-based early stop.
       if (inWindow.length > 0) {
         kept.push(...inWindow)
-        consecutiveOutOfWindowPages = 0
-      } else if (allBelowCutoff) {
-        consecutiveOutOfWindowPages++
-      } else {
-        consecutiveOutOfWindowPages = 0
       }
 
       setStatus(`Loading recent containers\u2026 (${kept.length} in window so far)`)
-
-      if (consecutiveOutOfWindowPages >= 2) {
-        cursor = null
-      }
     } while (cursor !== null && pageCount < PAGE_HARD_CAP)
+
+    // If the loop exited with a cursor still pending, PAGE_HARD_CAP (not the natural
+    // date boundary above) is what stopped pagination \u2014 the result may be truncated.
+    // Fail loudly: surface this in the status line rather than silently returning a
+    // short list (matches the existing truncation-note style used elsewhere, e.g. the
+    // "(window may be incomplete)" note on channel/recording saves).
+    const hitPageHardCap = cursor !== null
+    const hardCapNote = hitPageHardCap
+      ? ` \u26a0\ufe0f Hit ${PAGE_HARD_CAP}-page pagination cap \u2014 results may be truncated.`
+      : ""
 
     // Marked-include enrichment: fetch any marked chats that fell outside the
     // window so they always appear, regardless of timestamp staleness.
@@ -2358,9 +2514,9 @@ async function initialLoadChats(): Promise<void> {
     saveCachedChats(userKey, kept)
     updateLoadStep("chats", {
       state: "done",
-      detail: `Found ${kept.length} chat${kept.length === 1 ? "" : "s"} \u00b7 \u2605 ${favoritedChatIds().size} favorites`,
+      detail: `Found ${kept.length} chat${kept.length === 1 ? "" : "s"} \u00b7 \u2605 ${favoritedChatIds().size} favorites${hardCapNote}`,
     })
-    setStatus(`${kept.length} chats (${rangeStr}).`)
+    setStatus(`${kept.length} chats (${rangeStr}).${hardCapNote}`)
   } catch (err) {
     if (kept.length > 0) {
       chatsState = { chats: kept }
@@ -2461,8 +2617,17 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
       state: "done",
       detail: `Scanned recordings \u00b7 ${recTotal} found across ${withRecs} chat${withRecs === 1 ? "" : "s"}`,
     })
+    // Fail-loud signal (see getOrphanRecordingContainers): recordings whose
+    // owning chat fell outside the rendered window still get rendered as
+    // orphan rows, but that state is otherwise invisible \u2014 note it here.
+    const orphanContainers = getOrphanRecordingContainers(applyContainerFiltersAndSort(chatsState.chats))
+    const orphanRecCount = orphanContainers.reduce((s, c) => s + c.recordings.length, 0)
+    const orphanNote =
+      orphanRecCount > 0
+        ? ` \u00b7 ${orphanRecCount} recording(s) from chats outside the window`
+        : ""
     setStatus(
-      `${chatsState.chats.length} chats (${rangeStr}) \u00b7 ${recTotal} recording(s) across ${withRecs} chat(s)${result.truncated ? " \u00b7 (chat list truncated \u2014 narrow window)" : ""}.`,
+      `${chatsState.chats.length} chats (${rangeStr}) \u00b7 ${recTotal} recording(s) across ${withRecs} chat(s)${result.truncated ? " \u00b7 (chat list truncated \u2014 narrow window)" : ""}${orphanNote}.`,
     )
   } catch (err) {
     console.warn("[m365-pull] Recordings scan failed:", err)
