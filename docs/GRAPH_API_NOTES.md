@@ -162,6 +162,69 @@ If you need the picker, call it in the click handler **before any `await`**.
 
 ---
 
+## 9. Loop `.loop` → `?format=html` is documented but does not work
+
+Graph v1.0 [documents `loop` as a supported source extension](https://learn.microsoft.com/en-us/graph/api/driveitem-get-content-format?view=graph-rest-1.0)
+for both `format=html` (`loop, fluid, wbtx, whiteboard`) and `format=pdf`. Delegated
+`Files.Read` is listed as the least-privileged permission.
+
+**Measured 2026-08-07 with delegated `Files.Read.All` from a browser SPA: it fails on
+every file, in both formats.**
+
+```
+4 OneDrive-resident .loop files, each tried twice:
+
+  html →  HTTP 406   "An exception occurred while executing within the Sandbox"
+  pdf  →  HTTP 500   "An exception occurred while executing within the Sandbox"
+```
+
+Same exception text under two different status codes — one broken component, not two
+bugs. PDF is not a viable fallback for HTML.
+
+The request reaches the right service and is correctly typed; it is the conversion
+itself that throws:
+
+```
+https://southcentralus1-mediab.svc.ms/transform/html?provider=spo&inputFormat=loop&docid=...
+https://southcentralus1-mediab.svc.ms/transform/pdf ?provider=spo&inputFormat=loop&docid=...
+```
+
+**These files were in the documented-supported location.** The `docid` parameter resolves
+to `microsoft-my.sharepoint.com/_api/v2.0/drives/...` — OneDrive, not SharePoint Embedded.
+This is *not* the known SPE wall (§ below); it is the supported path failing.
+
+### What DOES work — don't rediscover this
+
+| Step | Result |
+|---|---|
+| MSAL delegated auth from a browser SPA | works |
+| `/me/drive/recent` for discovery | **useless** — 1 item, 0 Loop files |
+| `/search/query` + KQL `filetype:loop OR filetype:fluid` | **25 hits** (24 `.loop`, 1 `.fluid`) |
+| **CORS on the `svc.ms` 302 redirect** | **not a blocker** |
+| The conversion | fails 100% |
+
+The CORS result is worth stating loudly because it is undocumented and was the presumed
+blocker. `fetch` returned `type=cors`, `redirected=true`, and a **readable body** from
+`southcentralus1-mediab.svc.ms`. A CORS rejection would have thrown a `TypeError` with no
+body at all. A browser SPA *can* read the response — there just isn't a good one.
+
+### Also note
+
+- A `403 Access denied` (no redirect, Graph-level) appears for files visible in search but
+  in another user's drive. Same shape as the roster `403`s in §7 — expected, permanent.
+- The widely-circulated "`.loop` files are encrypted, content unavailable" answer is from
+  **January 2024** and is contradicted by current documentation. It is stale in a
+  *different* way than reality: the docs now promise a conversion that doesn't run.
+
+### Untested
+
+Whether this fails for **all** callers or only delegated ones. An app-only/backend token
+was not tried — that needs a client secret, which a no-backend SPA cannot hold. If someone
+tests app-only and it succeeds, the finding narrows to "delegated conversion is broken."
+Until then the honest scope is: **delegated, browser SPA, 8 attempts, 0 successes.**
+
+---
+
 ## The pattern worth internalizing
 
 Every bug above failed **silently**. Nothing threw. Nothing logged. The app returned a
