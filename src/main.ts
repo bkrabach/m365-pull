@@ -1666,7 +1666,14 @@ function renderContainerRow(
 
   const caret = `<button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
   const checkbox = `<input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">`
-  const favorite = `<span class="fav-state${isMarked ? " favorited" : ""}" title="${isMarked ? "Favorited \u2014 expand to change which streams" : "Not favorited \u2014 expand to favorite a stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}">${isMarked ? "\u2605" : "\u2606"}</span>`
+  // 81x: the collapsed chat header star is now a real toggle (was a read-only
+  // .fav-state span). A chat has two streams; the header star toggles the
+  // MESSAGES stream (documented choice) and is wired by the shared .fav-toggle
+  // listener. It still DISPLAYS filled whenever EITHER stream is favorited
+  // (isMarked), so the collapsed row honestly signals "this chat is favorited"
+  // even when only the Recordings stream is favorited (toggle that from the
+  // expanded Recordings header).
+  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to toggle the Messages stream (expand to change Recordings)" : "Favorite the Messages stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
   const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(sub)}</div>
@@ -3015,7 +3022,11 @@ function renderChannelRowHtml(
   const isExpanded = expandedChannelIds.has(channelId)
   const caret = `<button class="expand-toggle channel-expand-toggle" data-channel-id="${escapeHtml(channelId)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
   const checkbox = `<input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">`
-  const favorite = `<span class="fav-state${isFav ? " favorited" : ""}" title="${isFav ? "Favorited \u2014 expand to change" : "Not favorited \u2014 expand to favorite"}" aria-label="${isFav ? "Favorited" : "Not favorited"}">${isFav ? "\u2605" : "\u2606"}</span>`
+  // 81x: the collapsed channel header star is now a real toggle (was a read-only
+  // .fav-state span). Channels have a single stream, so it simply toggles the
+  // channel favorite via toggleChannelFavorite() (wired by the shared channel
+  // .fav-toggle[data-stream="channel"] listener).
+  const favorite = `<button class="fav-toggle fav-header-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>`
   const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(buildChannelSubLine(channel, preview, activityMs))}</div>
