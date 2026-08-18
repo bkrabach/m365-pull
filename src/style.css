@@ -991,6 +991,21 @@ header {
   cursor: progress;
 }
 
+/* hkh: persistent list bar directly above the results, holding the Flat/Grouped
+ * toggle (moved out of the VIEW toolbar section so it sits right by the list). */
+.list-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.list-bar .label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 /* Change 3: Grouped/Flat segmented view toggle in the toolbar. */
 .view-toggle {
   display: inline-flex;

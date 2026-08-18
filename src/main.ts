@@ -1045,13 +1045,8 @@ function render(): void {
               <option value="name">Name (A\u2013Z)</option>
             </select>
           </span>
-          <span class="field">
-            <span class="label">View:</span>
-            <span class="view-toggle" role="group" aria-label="View mode">
-              <button class="seg" id="view-flat" data-view="flat" title="Flat \\u2014 every artifact (messages + each recording) as its own row">Flat</button>
-              <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \\u2014 chat rows that expand into their artifacts">Grouped</button>
-            </span>
-          </span>
+          <!-- hkh: Flat/Grouped toggle moved out to the persistent list bar
+               (#list-bar, directly above the results); see below. -->
           <span class="field">
             <span class="label">Show:</span>
             <button class="chip active" id="filter-chats" title="Show chat messages">Chats</button>
@@ -1103,6 +1098,16 @@ function render(): void {
 
       <div id="scan-status" class="scan-status"></div>
       <div id="status"></div>
+      <!-- hkh: persistent Flat/Grouped control, surfaced directly above the list
+           (out of the Settings/VIEW section). Same IDs as before, so wiring and
+           persistence are unchanged and there is a single, never-desynced toggle. -->
+      <div id="list-bar" class="list-bar" hidden>
+        <span class="label">View:</span>
+        <span class="view-toggle" role="group" aria-label="View mode">
+          <button class="seg" id="view-flat" data-view="flat" title="Flat \u2014 every artifact (messages + each recording) as its own row">Flat</button>
+          <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \u2014 chat rows that expand into their artifacts">Grouped</button>
+        </span>
+      </div>
       <ul id="chats" class="chat-list"></ul>
     </main>
   `
@@ -2499,6 +2504,9 @@ function revealPostLoadSections(): void {
   const dl = document.getElementById("section-download")
   if (view) view.hidden = false
   if (dl) dl.hidden = false
+  // hkh: reveal the persistent list bar (Flat/Grouped toggle) with the results.
+  const bar = document.getElementById("list-bar")
+  if (bar) bar.hidden = false
 }
 
 /** §1 collapses to a one-line RECEIPT, and §2/§3 are revealed. */
