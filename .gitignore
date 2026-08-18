@@ -8,3 +8,6 @@ dist/
 .env
 .env.local
 .env.*.local
+
+# Lane goal-batch completion marker (worktree-local, not tracked)
+DONE.json
