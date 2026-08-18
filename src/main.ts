@@ -2501,7 +2501,11 @@ function showLoadChecklistView(): void {
   if (receipt) receipt.hidden = true
 }
 
-/** Reveal §2 VIEW and §3 DOWNLOAD (progressive disclosure: hidden until a load completes). */
+/** Reveal §2 VIEW and §3 DOWNLOAD (progressive disclosure: hidden until chats have
+ * loaded). Called as soon as the chat list has content (from initialLoadChats,
+ * BEFORE the background recordings/channels scans run) and again from
+ * showLoadReceipt/finalizeLoad once the load fully settles -- the second call is
+ * an idempotent no-op that just keeps this the single source of truth. */
 function revealPostLoadSections(): void {
   const view = document.getElementById("section-view")
   const dl = document.getElementById("section-download")
@@ -2846,6 +2850,20 @@ async function initialLoadChats(): Promise<void> {
     updateLoadStep("recordings", { state: "pending", detail: undefined })
     return
   }
+
+  // hkh/dzo/4qr: reveal the persistent list-bar (Flat/Grouped), the VIEW filters
+  // (Chats/Channels/Recordings, search, sort, Show hidden) and the DOWNLOAD
+  // section as soon as there's a chat list to show them next to -- do NOT wait
+  // for the (potentially long-running) background recordings scan below.
+  // finalizeLoad() still runs later (immediately for the recordings-off branch,
+  // or once the scan settles) to collapse the load picker into its one-line
+  // receipt; calling revealPostLoadSections() again there is a harmless no-op.
+  // Previously this reveal happened ONLY inside finalizeLoad(), so the whole
+  // list/filter bar stayed hidden for the entire recordings scan -- a visual
+  // smoke mid-scan correctly found no Flat/Grouped toggle, no Channels filter,
+  // and no reachable hidden-items control, because their shared container was
+  // still hidden the whole time.
+  revealPostLoadSections()
 
   // Compute the background-scan window once — shared by channels and recordings.
   const range2 = userPrefs.chatRange ?? { kind: "last-7d" }
