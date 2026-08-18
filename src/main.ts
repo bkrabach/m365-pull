@@ -1018,7 +1018,7 @@ function render(): void {
           </span>
           <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
           <button class="chip" id="hide-downloaded">Hide downloaded</button>
-          <button class="chip show-ignored" id="showignored" hidden>\u2298 Show ignored</button>
+          <button class="chip show-ignored" id="showignored" hidden>\u2298 Show hidden</button>
           <!-- Team picker: populated by renderTeamPicker() after teams are enumerated -->
           <div id="team-picker-field" class="field team-picker-field"></div>
         </div>
@@ -1055,7 +1055,7 @@ function render(): void {
           </label>
           <button id="bulk-containers" class="bulk-action" hidden></button>
           <button id="download-selected" class="bulk-action" hidden></button>
-          <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear ignored</button>
+          <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear hidden</button>
         </div>
       </section>
 
@@ -1417,11 +1417,24 @@ function rerenderContainerList(): void {
     // Render grouped (chat rows that expand) or flat (every artifact its own
     // top-level row). Channels are ONE row in both modes (no top-level explosion).
     const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+    // 4qr: hidden-items management panel (only when "Show hidden" is on).
+    const hiddenPanel = renderHiddenItemsPanel()
     if (viewMode === "flat") {
-      list.innerHTML = renderFlatArtifactRows(filtered, visibleChannels)
+      list.innerHTML = hiddenPanel + renderFlatArtifactRows(filtered, visibleChannels)
     } else {
-      list.innerHTML = buildUnifiedGroupedHtml(filtered, visibleChannels)
+      list.innerHTML = hiddenPanel + buildUnifiedGroupedHtml(filtered, visibleChannels)
     }
+    // 4qr: per-item Unhide buttons in the hidden-items panel.
+    list.querySelectorAll<HTMLButtonElement>(".unhide-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.unhideId!
+        if (btn.dataset.unhideKind === "channel") {
+          toggleChannelIgnore(id)
+        } else {
+          toggleIgnore(id)
+        }
+      })
+    })
     wireChannelListeners(list)
     // Chat container-action (download). :not([data-channel-id]) excludes channel
     // download buttons, which are already wired by wireChannelListeners above.
@@ -1581,7 +1594,7 @@ function updateContainerSummary(visible: number): void {
   const total = chatsState.chats.length
   const favorited = favoritedChatIds().size
   const ignored = ignoredIds.size
-  const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} ignored` : ""
+  const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} hidden` : ""
   // Recording scan progress lives in #scan-status (Item 4); omit from main status.
   const filtered = visible < total
   if (filtered) {
@@ -1641,6 +1654,50 @@ function downloadedLabelHtml(lastSync: string | number | undefined): string {
     ? `Downloaded ${formatDateShort(new Date(lastSync))}`
     : "Not downloaded yet"
   return `<span class="dl-label${downloaded ? " downloaded" : " not-downloaded"}">${escapeHtml(text)}</span>`
+}
+
+/** 4qr: the hide (formerly "ignore") toggle button. Flat/single rows now carry
+ * one too (previously only grouped headers did), so any item can be hidden. The
+ * `.ignore-toggle` class + data-chat-id / data-channel-id are unchanged, so the
+ * existing listeners wire these automatically; only the DISPLAYED wording is
+ * "Hide"/"Unhide". */
+function hideToggleHtml(kind: "chat" | "channel", id: string, isHidden: boolean): string {
+  const dataAttr = kind === "chat" ? `data-chat-id="${escapeHtml(id)}"` : `data-channel-id="${escapeHtml(id)}"`
+  const noun = kind === "chat" ? "chat" : "channel"
+  return `<button class="ignore-toggle${isHidden ? " ignored" : ""}" ${dataAttr} title="${isHidden ? `Unhide this ${noun}` : `Hide this ${noun}`}" aria-label="${isHidden ? "Unhide" : "Hide"}" aria-pressed="${isHidden ? "true" : "false"}">${isHidden ? "\u2299" : "\u2298"}</button>`
+}
+
+/** 4qr: the hidden-items management view. When "Show hidden" (showIgnored) is
+ * ON, a panel is prepended to the list enumerating every hidden chat/channel
+ * with a per-item Unhide button. Reuses the existing showIgnored flag and
+ * ignoredIds set; items whose owning chat/channel isn't currently loaded still
+ * appear (by id) so they can always be recovered. Returns "" when the flag is
+ * off or nothing is hidden. */
+function renderHiddenItemsPanel(): string {
+  if (!filterState.showIgnored || ignoredIds.size === 0) return ""
+  const items: { id: string; name: string; kind: "chat" | "channel" }[] = []
+  for (const id of ignoredIds) {
+    const chat = chatsState.chats.find((c) => c.id === id)
+    if (chat) {
+      items.push({ id, name: chatDisplayName(chat), kind: "chat" })
+      continue
+    }
+    const chan = channelsState.containers.find((c) => c.id === id)
+    if (chan) {
+      items.push({ id, name: "#" + chan.channelName, kind: "channel" })
+      continue
+    }
+    // Hidden but not currently loaded (out of window / different source).
+    items.push({ id, name: id, kind: "chat" })
+  }
+  items.sort((a, b) => a.name.localeCompare(b.name))
+  const rows = items
+    .map(
+      (it) =>
+        `<li class="hidden-item"><span class="hidden-item-name">${escapeHtml(it.name)}</span><button class="unhide-btn" data-unhide-id="${escapeHtml(it.id)}" data-unhide-kind="${it.kind}" aria-label="Unhide ${escapeHtml(it.name)}">Unhide</button></li>`,
+    )
+    .join("")
+  return `<li class="hidden-items-panel"><div class="hidden-items-header">Hidden items (${items.length})</div><ul class="hidden-items-list">${rows}</ul></li>`
 }
 
 /** aws: bounded page cap for the lazy in-window message count. If the window
@@ -1780,7 +1837,7 @@ function renderContainerRow(
   const actions =
     `${renderMessageIndicator(chat.id)}` +
     `${recIndicatorHtml}` +
-    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Unhide this chat" : "Hide this chat"}" aria-label="${isIgnored ? "Unhide" : "Hide"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
     `${downloadedLabelHtml(lastSync)}` +
     `<button class="container-action artifact-download"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
   return `
@@ -1828,7 +1885,10 @@ function messagesArtifactRowHtml(
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
       </div>`
-  const actions = `${downloadedLabelHtml(lastSync)}<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
+  // 4qr: flat/single rows now carry a hide toggle (grouped children don't — the
+  // container header already has one).
+  const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
+  const actions = `${hideBtn}${downloadedLabelHtml(lastSync)}<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
   return `
     <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</${tag}>
   `
@@ -1882,7 +1942,9 @@ function recordingArtifactRowHtml(
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
       </div>`
-  const actions = `${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
+  // 4qr: flat/single recording rows carry a hide toggle (hides the owning chat).
+  const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
+  const actions = `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
   // kkc: grouped recording rows reserve an EMPTY favorite slot (favBtn === "")
   // so their checkbox\u2192type-icon gap matches message rows; flat rows carry the
   // shared recordings-stream \u2605.
@@ -2274,7 +2336,7 @@ function toggleIgnore(id: string): void {
     const label = chatItem ? `"${escapeHtml(chatDisplayName(chatItem))}"` : "Container"
     const statusEl = document.getElementById("status")
     if (statusEl) {
-      statusEl.innerHTML = `${label} ignored. <button class="link-button" id="undo-ignore">Undo</button>`
+      statusEl.innerHTML = `${label} hidden. <button class="link-button" id="undo-ignore">Undo</button>`
       const undoBtn = document.getElementById("undo-ignore")
       if (undoBtn) {
         undoBtn.addEventListener("click", () => {
@@ -2314,7 +2376,7 @@ function clearAllIgnored(): void {
   saveIgnored(userCacheKey(), ignoredIds)
   rerenderContainerList()
   scheduleOneDriveSave()
-  setStatus(`Cleared ${count} ignored container${count === 1 ? "" : "s"}.`)
+  setStatus(`Cleared ${count} hidden item${count === 1 ? "" : "s"}.`)
 }
 
 function updateTypeCountChips(): void {
@@ -3111,7 +3173,9 @@ function renderChannelRowHtml(
         <div class="artifact-name">${escapeHtml(name)}</div>
         <div class="artifact-sub">${escapeHtml(sub)}</div>
       </div>`
-    const actions = `${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
+    // 4qr: flat/single channel rows carry a hide toggle too.
+    const hideBtn = hideToggleHtml("channel", channelId, isIgnored)
+    const actions = `${hideBtn}${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
     return `
     <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""} ac-row" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</li>
   `
@@ -3132,7 +3196,7 @@ function renderChannelRowHtml(
         </div>`
   const actions =
     `${renderThreadIndicator(preview)}` +
-    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Unhide this channel" : "Hide this channel"}" aria-label="${isIgnored ? "Unhide" : "Hide"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
     `${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}` +
     `<button class="container-action artifact-download" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}" title="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
   return `
