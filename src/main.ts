@@ -124,6 +124,20 @@ interface ChannelPreviewEntry {
   windowStamp: number
 }
 
+/** aws: per-chat in-window message COUNT state — a lazy, bounded, tri-state
+ * badge mirroring the channel thread-count pattern (ChannelPreviewEntry /
+ * ensureChannelPreview / renderThreadIndicator). Populated on first chat expand,
+ * never eagerly at render for every chat. */
+interface ChatCountEntry {
+  status: "loading" | "resolved" | "error"
+  count: number
+  /** true when the bounded page cap was hit before the window was exhausted
+   * (rendered as "N+"). */
+  truncated: boolean
+  /** Window stamp when fetched; stale if != channelWindowStamp. */
+  windowStamp: number
+}
+
 type SortKey = "marked-first" | "recent" | "name"
 
 interface FilterState {
@@ -132,6 +146,13 @@ interface FilterState {
   sortKey: SortKey
   markedOnly: boolean
   showIgnored: boolean
+  // dzo: top-level item-kind view filters (default all ON), persisted in
+  // ui-state chatFilter. Applied in applyContainerFiltersAndSort (chats) and the
+  // channel path of rerenderContainerList (channels), plus per-row message/
+  // recording gating.
+  showChats: boolean
+  showChannels: boolean
+  showRecordings: boolean
 }
 
 type SyncStatus = "idle" | "syncing" | "synced" | "error" | "offline"
@@ -171,6 +192,9 @@ let availableTeams: TeamInfo[] = []
 const channelActivityMap: Map<string, number | null> = new Map()
 /** Matches channelWindowStamp — stale activity resolutions are discarded when they differ. */
 let channelActivityStamp = 0
+/** aws: per-chat in-window message count state (lazy, on first expand). Keyed by
+ * chatId. Cleared alongside channelPreviewMap whenever the window changes. */
+let chatMessageCountMap: Map<string, ChatCountEntry> = new Map()
 /** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
 let recordingsMap: Map<string, RecordingContainer> = new Map()
 /** True while the background recordings scan is running; rows show pending indicator. */
@@ -183,7 +207,13 @@ let filterState: FilterState = {
   sortKey: "marked-first",
   markedOnly: false,
   showIgnored: false,
+  showChats: true,
+  showChannels: true,
+  showRecordings: true,
 }
+/** nhk: whether the Teams (channels) picker is collapsed to a selected-summary.
+ * Persisted per-device in ui-state. Defaults to collapsed. */
+let teamPickerCollapsed = true
 let markedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
@@ -809,6 +839,17 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     }
     if (!filterState.enabledTypes.has(c.chatType)) return false
     if (filterState.markedOnly && !isChatFavorited(c.id)) return false
+    // dzo: item-kind view filters (chat path). A chat contributes a messages
+    // artifact and/or recordings; drop it entirely when neither would show given
+    // the current Chats/Recordings toggles. Per-row gating (below, in the render
+    // builders) hides the individual message vs recording rows.
+    {
+      const rc = recordingsMap.get(c.id)
+      const hasRec = !!rc && rc.recordings.length > 0
+      const chatMsgVisible = filterState.showChats && loadIncludeMessages
+      const chatRecVisible = filterState.showRecordings && hasRec
+      if (!chatMsgVisible && !chatRecVisible) return false
+    }
     // Build B: Messages OFF => recordings-only. A chat with no recording has
     // nothing to show in this scope, so filter it out. (Until the recording scan
     // lands, no chat has a recording yet — but §2/§3 aren't revealed until the
@@ -842,6 +883,18 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     })
   }
   return result
+}
+
+/** dzo: message artifact rows are visible when messages were loaded AND the
+ * "Chats" view filter is on. (Download scope + selection still follow the load
+ * flags, not the view filter.) */
+function messageRowsVisible(): boolean {
+  return loadIncludeMessages && filterState.showChats
+}
+/** dzo: recording artifact rows/badges are visible when the "Recordings" view
+ * filter is on. */
+function recordingRowsVisible(): boolean {
+  return filterState.showRecordings
 }
 
 function countByType(chats: TeamsChatItem[]): Map<string, number> {
@@ -992,16 +1045,17 @@ function render(): void {
               <option value="name">Name (A\u2013Z)</option>
             </select>
           </span>
+          <!-- hkh: Flat/Grouped toggle moved out to the persistent list bar
+               (#list-bar, directly above the results); see below. -->
           <span class="field">
-            <span class="label">View:</span>
-            <span class="view-toggle" role="group" aria-label="View mode">
-              <button class="seg" id="view-flat" data-view="flat" title="Flat \\u2014 every artifact (messages + each recording) as its own row">Flat</button>
-              <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \\u2014 chat rows that expand into their artifacts">Grouped</button>
-            </span>
+            <span class="label">Show:</span>
+            <button class="chip active" id="filter-chats" title="Show chat messages">Chats</button>
+            <button class="chip active" id="filter-channels" title="Show channels">Channels</button>
+            <button class="chip active" id="filter-recordings" title="Show recordings">Recordings</button>
           </span>
           <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
           <button class="chip" id="hide-downloaded">Hide downloaded</button>
-          <button class="chip show-ignored" id="showignored" hidden>\u2298 Show ignored</button>
+          <button class="chip show-ignored" id="showignored" hidden>\u2298 Show hidden</button>
           <!-- Team picker: populated by renderTeamPicker() after teams are enumerated -->
           <div id="team-picker-field" class="field team-picker-field"></div>
         </div>
@@ -1038,12 +1092,22 @@ function render(): void {
           </label>
           <button id="bulk-containers" class="bulk-action" hidden></button>
           <button id="download-selected" class="bulk-action" hidden></button>
-          <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear ignored</button>
+          <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear hidden</button>
         </div>
       </section>
 
       <div id="scan-status" class="scan-status"></div>
       <div id="status"></div>
+      <!-- hkh: persistent Flat/Grouped control, surfaced directly above the list
+           (out of the Settings/VIEW section). Same IDs as before, so wiring and
+           persistence are unchanged and there is a single, never-desynced toggle. -->
+      <div id="list-bar" class="list-bar" hidden>
+        <span class="label">View:</span>
+        <span class="view-toggle" role="group" aria-label="View mode">
+          <button class="seg" id="view-flat" data-view="flat" title="Flat \u2014 every artifact (messages + each recording) as its own row">Flat</button>
+          <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \u2014 chat rows that expand into their artifacts">Grouped</button>
+        </span>
+      </div>
       <ul id="chats" class="chat-list"></ul>
     </main>
   `
@@ -1235,6 +1299,21 @@ function wireGlobalHandlers(account: AccountInfo): void {
     saveUIPrefs()
   })
 
+  // dzo: item-kind view filters (Chats / Channels / Recordings, default all ON).
+  const wireKindFilter = (id: string, get: () => boolean, set: (v: boolean) => void) => {
+    const btn = document.getElementById(id) as HTMLButtonElement | null
+    if (!btn) return
+    btn.addEventListener("click", () => {
+      set(!get())
+      btn.classList.toggle("active", get())
+      rerenderContainerList()
+      saveUIPrefs()
+    })
+  }
+  wireKindFilter("filter-chats", () => filterState.showChats, (v) => (filterState.showChats = v))
+  wireKindFilter("filter-channels", () => filterState.showChannels, (v) => (filterState.showChannels = v))
+  wireKindFilter("filter-recordings", () => filterState.showRecordings, (v) => (filterState.showRecordings = v))
+
   // Show ignored toggle
   el<HTMLButtonElement>("showignored").addEventListener("click", () => {
     filterState.showIgnored = !filterState.showIgnored
@@ -1304,12 +1383,16 @@ function saveUIPrefs(): void {
     | null
   saveUIState(userCacheKey(), {
     lookback: lookbackEl?.value,
+    teamPickerCollapsed,
     chatFilter: {
       search: filterState.search,
       enabledTypes: [...filterState.enabledTypes],
       sortKey: filterState.sortKey,
       markedOnly: filterState.markedOnly,
       showIgnored: filterState.showIgnored,
+      showChats: filterState.showChats,
+      showChannels: filterState.showChannels,
+      showRecordings: filterState.showRecordings,
     },
   })
 }
@@ -1318,6 +1401,7 @@ function saveUIPrefs(): void {
  * Runs after the HTML is rendered (handlers wired later read these values). */
 function hydrateUIStateFromStorage(): void {
   const saved = loadUIState(userCacheKey())
+  if (saved.teamPickerCollapsed !== undefined) teamPickerCollapsed = saved.teamPickerCollapsed
   if (saved.chatFilter) {
     filterState = {
       search: saved.chatFilter.search ?? "",
@@ -1327,6 +1411,9 @@ function hydrateUIStateFromStorage(): void {
       sortKey: saved.chatFilter.sortKey ?? "marked-first",
       markedOnly: saved.chatFilter.markedOnly ?? false,
       showIgnored: saved.chatFilter.showIgnored ?? false,
+      showChats: saved.chatFilter.showChats ?? true,
+      showChannels: saved.chatFilter.showChannels ?? true,
+      showRecordings: saved.chatFilter.showRecordings ?? true,
     }
   }
 }
@@ -1347,6 +1434,16 @@ function syncUIControlsFromState(): void {
   if (markedOnlyChat) markedOnlyChat.classList.toggle("active", filterState.markedOnly)
   const showIgnoredBtn = document.getElementById("showignored")
   if (showIgnoredBtn) showIgnoredBtn.classList.toggle("active", filterState.showIgnored)
+  // dzo: item-kind view filter chips
+  const kindFilters: [string, boolean][] = [
+    ["filter-chats", filterState.showChats],
+    ["filter-channels", filterState.showChannels],
+    ["filter-recordings", filterState.showRecordings],
+  ]
+  for (const [id, on] of kindFilters) {
+    const btn = document.getElementById(id)
+    if (btn) btn.classList.toggle("active", on)
+  }
   document
     .querySelectorAll<HTMLButtonElement>("#type-chips .chip[data-type]")
     .forEach((chip) => {
@@ -1366,6 +1463,8 @@ function rerenderContainerList(): void {
   const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
   const q = filterState.search.trim().toLowerCase()
   const visibleChannels: ChannelContainer[] = channelsState.containers.filter((c) => {
+    // dzo: channel view-filter toggle (channel path).
+    if (!filterState.showChannels) return false
     if (selectedTeamSet.size === 0 || !selectedTeamSet.has(c.teamId)) return false
     const isIgnored = ignoredIds.has(c.id)
     if (filterState.showIgnored) return isIgnored
@@ -1400,11 +1499,24 @@ function rerenderContainerList(): void {
     // Render grouped (chat rows that expand) or flat (every artifact its own
     // top-level row). Channels are ONE row in both modes (no top-level explosion).
     const viewMode = userPrefs.viewMode === "grouped" ? "grouped" : "flat"
+    // 4qr: hidden-items management panel (only when "Show hidden" is on).
+    const hiddenPanel = renderHiddenItemsPanel()
     if (viewMode === "flat") {
-      list.innerHTML = renderFlatArtifactRows(filtered, visibleChannels)
+      list.innerHTML = hiddenPanel + renderFlatArtifactRows(filtered, visibleChannels)
     } else {
-      list.innerHTML = buildUnifiedGroupedHtml(filtered, visibleChannels)
+      list.innerHTML = hiddenPanel + buildUnifiedGroupedHtml(filtered, visibleChannels)
     }
+    // 4qr: per-item Unhide buttons in the hidden-items panel.
+    list.querySelectorAll<HTMLButtonElement>(".unhide-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const id = btn.dataset.unhideId!
+        if (btn.dataset.unhideKind === "channel") {
+          toggleChannelIgnore(id)
+        } else {
+          toggleIgnore(id)
+        }
+      })
+    })
     wireChannelListeners(list)
     // Chat container-action (download). :not([data-channel-id]) excludes channel
     // download buttons, which are already wired by wireChannelListeners above.
@@ -1473,6 +1585,9 @@ function rerenderContainerList(): void {
           btn.textContent = "\u25be"
           btn.title = "Collapse artifacts"
           li.classList.add("expanded")
+          // aws: lazily resolve the in-window message count on first expand
+          // (never eagerly for every chat at render).
+          void ensureChatMessageCount(chatId)
         }
       })
     })
@@ -1561,7 +1676,7 @@ function updateContainerSummary(visible: number): void {
   const total = chatsState.chats.length
   const favorited = favoritedChatIds().size
   const ignored = ignoredIds.size
-  const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} ignored` : ""
+  const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} hidden` : ""
   // Recording scan progress lives in #scan-status (Item 4); omit from main status.
   const filtered = visible < total
   if (filtered) {
@@ -1569,6 +1684,171 @@ function updateContainerSummary(visible: number): void {
   } else {
     setStatus(`${total} chats loaded \u00b7 ${favorited} favorited${ignoredNote}`)
   }
+}
+
+/** STEP 0 shared row renderer.
+ *
+ * Every list row — grouped chat/channel header, flat message/recording/channel
+ * row, grouped child row, group sub-header, channel thread/tail row — emits the
+ * SAME fixed left-column order through this one helper, so columns line up
+ * regardless of which slots a given row actually fills:
+ *
+ *   [expand-caret][checkbox][favorite][type-icon][title/sub info][right actions]
+ *
+ * A slot the row doesn't use renders an empty `.ac-slot` spacer so the grid
+ * still reserves its column (flat rows reserve an empty caret slot; recording
+ * child rows reserve an empty favorite slot). The `.ac-row` CSS grid gives the
+ * columns their fixed widths. `info` and `actions` are full HTML strings the
+ * caller builds, so existing per-row typography/controls are reused verbatim. */
+interface AcRowSlots {
+  caret?: string
+  checkbox?: string
+  favorite?: string
+  icon?: string
+  info: string
+  actions?: string
+}
+
+const AC_SLOT_EMPTY = `<span class="ac-slot" aria-hidden="true"></span>`
+
+/** Build the ordered inner cells of a `.ac-row` grid (caret→checkbox→favorite
+ * →icon→info→actions). Callers wrap this in the row element (`<li>`/`<div>`
+ * carrying `.ac-row`), or, for expandable containers, in `<div class="ac-row">`
+ * followed by the expandable `.artifact-rows` block. */
+function acRowCells(slots: AcRowSlots): string {
+  return (
+    `${slots.caret ?? AC_SLOT_EMPTY}` +
+    `${slots.checkbox ?? AC_SLOT_EMPTY}` +
+    `${slots.favorite ?? AC_SLOT_EMPTY}` +
+    `${slots.icon ?? AC_SLOT_EMPTY}` +
+    `${slots.info}` +
+    `<div class="row-actions">${slots.actions ?? ""}</div>`
+  )
+}
+
+/** nxq: the download-status label that lives in the right action cluster (just
+ * left of the download button), for every row type. `lastSync` is the row's
+ * own last-download timestamp (ms) or undefined. Always renders — including an
+ * explicit "Not downloaded yet" (previously missing on single recordings). */
+function downloadedLabelHtml(lastSync: string | number | undefined): string {
+  const downloaded = lastSync !== undefined
+  const text = downloaded
+    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
+    : "Not downloaded yet"
+  return `<span class="dl-label${downloaded ? " downloaded" : " not-downloaded"}">${escapeHtml(text)}</span>`
+}
+
+/** 4qr: the hide (formerly "ignore") toggle button. Flat/single rows now carry
+ * one too (previously only grouped headers did), so any item can be hidden. The
+ * `.ignore-toggle` class + data-chat-id / data-channel-id are unchanged, so the
+ * existing listeners wire these automatically; only the DISPLAYED wording is
+ * "Hide"/"Unhide". */
+function hideToggleHtml(kind: "chat" | "channel", id: string, isHidden: boolean): string {
+  const dataAttr = kind === "chat" ? `data-chat-id="${escapeHtml(id)}"` : `data-channel-id="${escapeHtml(id)}"`
+  const noun = kind === "chat" ? "chat" : "channel"
+  return `<button class="ignore-toggle${isHidden ? " ignored" : ""}" ${dataAttr} title="${isHidden ? `Unhide this ${noun}` : `Hide this ${noun}`}" aria-label="${isHidden ? "Unhide" : "Hide"}" aria-pressed="${isHidden ? "true" : "false"}">${isHidden ? "\u2299" : "\u2298"}</button>`
+}
+
+/** 4qr: the hidden-items management view. When "Show hidden" (showIgnored) is
+ * ON, a panel is prepended to the list enumerating every hidden chat/channel
+ * with a per-item Unhide button. Reuses the existing showIgnored flag and
+ * ignoredIds set; items whose owning chat/channel isn't currently loaded still
+ * appear (by id) so they can always be recovered. Returns "" when the flag is
+ * off or nothing is hidden. */
+function renderHiddenItemsPanel(): string {
+  if (!filterState.showIgnored || ignoredIds.size === 0) return ""
+  const items: { id: string; name: string; kind: "chat" | "channel" }[] = []
+  for (const id of ignoredIds) {
+    const chat = chatsState.chats.find((c) => c.id === id)
+    if (chat) {
+      items.push({ id, name: chatDisplayName(chat), kind: "chat" })
+      continue
+    }
+    const chan = channelsState.containers.find((c) => c.id === id)
+    if (chan) {
+      items.push({ id, name: "#" + chan.channelName, kind: "channel" })
+      continue
+    }
+    // Hidden but not currently loaded (out of window / different source).
+    items.push({ id, name: id, kind: "chat" })
+  }
+  items.sort((a, b) => a.name.localeCompare(b.name))
+  const rows = items
+    .map(
+      (it) =>
+        `<li class="hidden-item"><span class="hidden-item-name">${escapeHtml(it.name)}</span><button class="unhide-btn" data-unhide-id="${escapeHtml(it.id)}" data-unhide-kind="${it.kind}" aria-label="Unhide ${escapeHtml(it.name)}">Unhide</button></li>`,
+    )
+    .join("")
+  return `<li class="hidden-items-panel"><div class="hidden-items-header">Hidden items (${items.length})</div><ul class="hidden-items-list">${rows}</ul></li>`
+}
+
+/** aws: bounded page cap for the lazy in-window message count. If the window
+ * still has messages beyond this many, the badge renders "N+". Keeps the count
+ * cheap — we never page an entire chat just to badge it. */
+const CHAT_COUNT_PAGE_CAP = 200
+
+/** aws: the in-window message-count badge for a chat (grouped rows), mirroring
+ * the channel thread badge (renderThreadIndicator). Returns "" until the count
+ * has actually been requested (first expand) or if the cached entry is stale for
+ * the current window — we never trigger a fetch from render. */
+function renderMessageIndicator(chatId: string): string {
+  const entry = chatMessageCountMap.get(chatId)
+  if (!entry || entry.windowStamp !== channelWindowStamp) return ""
+  if (entry.status === "loading") {
+    return `<span class="msg-indicator pending" aria-label="Message count loading"><span aria-hidden="true">\uD83D\uDCAC \u2026</span></span>`
+  }
+  if (entry.status === "error") return ""
+  const n = entry.count
+  const label = entry.truncated ? `${n}+` : String(n)
+  return `<span class="msg-indicator" aria-label="${label} message${n !== 1 ? "s" : ""} in range" title="${label} message${n !== 1 ? "s" : ""} in range"><span aria-hidden="true">\uD83D\uDCAC ${escapeHtml(label)}</span></span>`
+}
+
+/** aws: fetch and cache a chat's in-window message COUNT (lazy, on first expand).
+ * Mirrors ensureChannelPreview: dedupes in-flight/resolved entries, stamps with
+ * the current window, discards superseded results, and re-renders on state
+ * change. Bounded by CHAT_COUNT_PAGE_CAP so a chat is never fully paginated just
+ * to show a badge; hitting the cap renders as "N+". */
+async function ensureChatMessageCount(chatId: string): Promise<void> {
+  const stamp = channelWindowStamp
+  const existing = chatMessageCountMap.get(chatId)
+  if (
+    existing &&
+    existing.windowStamp === stamp &&
+    (existing.status === "loading" || existing.status === "resolved")
+  ) {
+    return
+  }
+  chatMessageCountMap.set(chatId, {
+    status: "loading",
+    count: 0,
+    truncated: false,
+    windowStamp: stamp,
+  })
+  rerenderContainerList()
+
+  const { fromMs } = getChannelWindow()
+  try {
+    const msgs = await fetchChatMessages(msal, chatId, {
+      since: new Date(fromMs),
+      maxMessages: CHAT_COUNT_PAGE_CAP,
+    })
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    chatMessageCountMap.set(chatId, {
+      status: "resolved",
+      count: msgs.length,
+      truncated: msgs.length >= CHAT_COUNT_PAGE_CAP,
+      windowStamp: stamp,
+    })
+  } catch {
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    chatMessageCountMap.set(chatId, {
+      status: "error",
+      count: 0,
+      truncated: false,
+      windowStamp: stamp,
+    })
+  }
+  rerenderContainerList()
 }
 
 function renderContainerRow(
@@ -1579,16 +1859,14 @@ function renderContainerRow(
   const isMarked = isChatFavorited(chat.id)
   const isIgnored = ignoredIds.has(chat.id)
   const lastSync = chatPrefs[chat.id]?.lastSync
-  // Item 5: capitalise "Downloaded"; make no-download state explicit.
-  const downloadedTag = lastSync
-    ? ` \u00b7 Downloaded ${formatDateShort(new Date(lastSync))}`
-    : " \u00b7 Not downloaded yet"
-  const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below).
+  const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}`
 
   // Phase 1 recording indicator: only show badge when recordings are confirmed.
   // All other states (pending, none, unknown) = silence ("no-recording = silence" design).
   let recIndicatorHtml = ""
-  if (recContainer !== undefined && recContainer.recordings.length > 0) {
+  if (recContainer !== undefined && recContainer.recordings.length > 0 && recordingRowsVisible()) {
     const n = recContainer.recordings.length
     const truncNote = recContainer.truncated ? " (may be incomplete)" : ""
     recIndicatorHtml = `<span class="rec-indicator" aria-label="${n} recording${n !== 1 ? "s" : ""}${truncNote}" title="${n} recording${n !== 1 ? "s" : ""} in range${truncNote}"><span aria-hidden="true">\uD83C\uDF99 ${n}</span></span>`
@@ -1598,21 +1876,20 @@ function renderContainerRow(
   const wantMessages = loadIncludeMessages
   const hasRecordings = recContainer !== undefined && recContainer.recordings.length > 0
   const wantRecordings = loadIncludeRecordings && hasRecordings
-  let downloadBtnInner: string
+  // kkc: group download button is now the same icon-only \u2b07 as the per-row
+  // download buttons (emoji/text labels stripped); the aria-label still carries
+  // the full scope, and the disabled/"nothing to download" state is preserved.
+  const downloadBtnInner = `<span aria-hidden="true">\u2b07</span>`
   let downloadBtnDisabled = ""
   let downloadBtnTitle = ""
   let downloadBtnAriaLabel: string
   if (wantMessages && wantRecordings) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC\uD83C\uDF99</span>`
     downloadBtnAriaLabel = "Download messages and recordings"
   } else if (wantMessages) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC</span>`
     downloadBtnAriaLabel = "Download messages"
   } else if (wantRecordings) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83C\uDF99</span>`
     downloadBtnAriaLabel = "Download recordings"
   } else {
-    downloadBtnInner = "Download"
     downloadBtnDisabled = " disabled"
     downloadBtnTitle = ` title="Nothing to download for current Include settings"`
     downloadBtnAriaLabel = "Download \u2014 nothing to download for current Include settings"
@@ -1625,20 +1902,29 @@ function renderContainerRow(
   const allSelected = selectedCount > 0 && selectedCount === artifactIds.length
   // indeterminate state (someSelected) must be set via JS after render \u2014 not expressible in HTML
 
-  return `
-    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
-      <div class="chat-row-header">
-        <button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
-        <input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">
-        <span class="fav-state${isMarked ? " favorited" : ""}" title="${isMarked ? "Favorited \u2014 expand to change which streams" : "Not favorited \u2014 expand to favorite a stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}">${isMarked ? "\u2605" : "\u2606"}</span>
-        <div class="chat-info">
+  const caret = `<button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
+  const checkbox = `<input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">`
+  // 81x: the collapsed chat header star is now a real toggle (was a read-only
+  // .fav-state span). A chat has two streams; the header star toggles the
+  // MESSAGES stream (documented choice) and is wired by the shared .fav-toggle
+  // listener. It still DISPLAYS filled whenever EITHER stream is favorited
+  // (isMarked), so the collapsed row honestly signals "this chat is favorited"
+  // even when only the Recordings stream is favorited (toggle that from the
+  // expanded Recordings header).
+  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to toggle the Messages stream (expand to change Recordings)" : "Favorite the Messages stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
+  const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(sub)}</div>
-        </div>
-        ${recIndicatorHtml}
-        <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-        <button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>
-      </div>
+        </div>`
+  const actions =
+    `${renderMessageIndicator(chat.id)}` +
+    `${recIndicatorHtml}` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Unhide this chat" : "Hide this chat"}" aria-label="${isIgnored ? "Unhide" : "Hide"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `${downloadedLabelHtml(lastSync)}` +
+    `<button class="container-action artifact-download"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
+  return `
+    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
+      <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
       <div class="artifact-rows"${isExpanded ? "" : " hidden"}>
         ${renderArtifactRows(chat, recContainer)}
       </div>
@@ -1666,28 +1952,27 @@ function messagesArtifactRowHtml(
   const msgSelected = selectedArtifacts.has(msgArtId)
   const msgFav = isMessagesFavorited(chatId)
   const lastSync = chatPrefs[chatId]?.lastSync
-  const dlTag = lastSync
-    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
-    : "Not downloaded yet"
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below).
   const lastActivity = formatDate(new Date(chatActivityDate(chat)).toISOString())
   const nameRaw = flat ? chatName : "Messages"
-  const subRaw = flat
-    ? `Messages \u00b7 ${lastActivity} \u00b7 ${dlTag}`
-    : `${lastActivity} \u00b7 ${dlTag}`
+  const subRaw = flat ? `Messages \u00b7 ${lastActivity}` : `${lastActivity}`
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const ctxSuffix = flat ? ` for ${chatName}` : ""
-  return `
-    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">
-      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact${escapeHtml(ctxSuffix)}">
-      <button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>
-      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>
-      <div class="artifact-info">
+  const checkbox = `<input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact${escapeHtml(ctxSuffix)}">`
+  const favorite = `<button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>`
+  const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>`
+  const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
-      </div>
-      <button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>
-    </${tag}>
+      </div>`
+  // 4qr: flat/single rows now carry a hide toggle (grouped children don't — the
+  // container header already has one).
+  const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
+  const actions = `${hideBtn}${downloadedLabelHtml(lastSync)}<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
+  return `
+    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</${tag}>
   `
 }
 
@@ -1719,31 +2004,36 @@ function recordingArtifactRowHtml(
     .filter(Boolean)
     .join(", ")
   const recLastSync = recordingPrefs[rec.id]?.lastSync
-  const recTag = recLastSync
-    ? ` \u00b7 Downloaded ${formatDateShort(new Date(recLastSync))}`
-    : ""
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below) \u2014 this also adds the previously
+  // missing "Not downloaded yet" state for single recordings.
   const baseSub = [duration, attendees].filter(Boolean).join(" \u00b7 ")
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const recFav = isRecordingsFavorited(chatId)
-  const favBtn = flat
-    ? `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
-    : ""
+  // 84b: the recordings-stream favorite star lives on the recording rows in BOTH
+  // views now (the "Recordings (N)" group sub-header is a plain count label, no
+  // star). Toggling any recording row's star toggles the one shared recordings
+  // stream (all rows re-render in sync).
+  const favBtn = `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
   const nameRaw = flat ? chatName : `Recording \u2014 ${dateLabel}`
   const subRaw = flat
-    ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}${recTag}`
-    : `${baseSub}${recTag}`
-  return `
-    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">
-      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">
-      ${favBtn}
-      <span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>
-      <div class="artifact-info">
+    ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}`
+    : `${baseSub}`
+  const checkbox = `<input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">`
+  const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>`
+  const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
-      </div>
-      <button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>
-    </${tag}>
+      </div>`
+  // 4qr: flat/single recording rows carry a hide toggle (hides the owning chat).
+  const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
+  const actions = `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
+  // kkc + 84b: every recording row (grouped and flat) fills the favorite column
+  // with the shared recordings-stream \u2605, so the checkbox\u2192type-icon gap matches
+  // message/chat rows and the column still aligns.
+  return `
+    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite: favBtn, icon, info, actions })}</${tag}>
   `
 }
 
@@ -1754,19 +2044,18 @@ function renderArtifactRows(
   recContainer: RecordingContainer | undefined,
 ): string {
   // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
-  let html = loadIncludeMessages ? messagesArtifactRowHtml(chat, "grouped") : ""
+  let html = messageRowsVisible() ? messagesArtifactRowHtml(chat, "grouped") : ""
 
   if (recContainer && recContainer.recordings.length > 0) {
     const n = recContainer.recordings.length
     const chatId = chat.id
-    const recFav = isRecordingsFavorited(chatId)
-    // Recordings-stream favorite lives on a group header (the stream is the unit;
-    // individual recordings are immutable and not separately favoritable).
+    // 84b: the "Recordings (N)" sub-header is a plain count LABEL now — the stray
+    // greyed \u2606 (which looked non-favoritable on a section header) is gone. The
+    // recordings-stream favorite \u2605 lives on the recording rows themselves (see
+    // recordingArtifactRowHtml), where it reads as an interactive control and
+    // still toggles the one shared recordings stream.
     html += `
-      <div class="artifact-group-header" data-chat-id="${escapeHtml(chatId)}">
-        <button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>
-        <span class="artifact-group-label">Recordings (${n})</span>
-      </div>
+      <div class="artifact-group-header ac-row" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ info: `<span class="artifact-group-label">Recordings (${n})</span>` })}</div>
     `
     for (const rec of recContainer.recordings) {
       html += recordingArtifactRowHtml(chat, rec, "grouped")
@@ -1784,6 +2073,9 @@ function renderArtifactRows(
  * recordings at render (the original bug), they're surfaced as "orphans" \u2014
  * a fail-loud safety net. Excludes empty containers (nothing to render). */
 function getOrphanRecordingContainers(chats: TeamsChatItem[]): RecordingContainer[] {
+  // dzo: orphan recordings are recordings; hide them when the Recordings view
+  // filter is off.
+  if (!recordingRowsVisible()) return []
   const chatIds = new Set(chats.map((c) => c.id))
   return [...recordingsMap.values()].filter(
     (c) => !chatIds.has(c.chatId) && c.recordings.length > 0,
@@ -1899,14 +2191,14 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
     // interleave with other items that happened between those weeks.
     const items: { ms: number; html: string }[] = []
     for (const chat of chats) {
-      if (loadIncludeMessages) {
+      if (messageRowsVisible()) {
         items.push({
           ms: chatActivityDate(chat),
           html: messagesArtifactRowHtml(chat, "flat"),
         })
       }
       const rc = recordingsMap.get(chat.id)
-      if (rc && rc.recordings.length > 0) {
+      if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
         for (const rec of rc.recordings) {
           items.push({
             ms: new Date(rec.eventCreatedDateTime).getTime(),
@@ -1943,7 +2235,7 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
     // per-artifact timestamps as the "recent" branch above).
     const items: { fav: boolean; ms: number; html: string }[] = []
     for (const chat of chats) {
-      if (loadIncludeMessages) {
+      if (messageRowsVisible()) {
         items.push({
           fav: isMessagesFavorited(chat.id),     // messages-stream key = bare chatId
           ms: chatActivityDate(chat),
@@ -1951,7 +2243,7 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
         })
       }
       const rc = recordingsMap.get(chat.id)
-      if (rc && rc.recordings.length > 0) {
+      if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
         for (const rec of rc.recordings) {
           items.push({
             fav: isRecordingsFavorited(chat.id), // recordings-stream key (per recStreamKey)
@@ -1992,9 +2284,9 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
   const blocks: { name: string; html: string }[] = []
   for (const chat of chats) {
     const chatHtmls: string[] = []
-    if (loadIncludeMessages) chatHtmls.push(messagesArtifactRowHtml(chat, "flat"))
+    if (messageRowsVisible()) chatHtmls.push(messagesArtifactRowHtml(chat, "flat"))
     const rc = recordingsMap.get(chat.id)
-    if (rc && rc.recordings.length > 0) {
+    if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
       for (const rec of rc.recordings) {
         chatHtmls.push(recordingArtifactRowHtml(chat, rec, "flat"))
       }
@@ -2132,7 +2424,7 @@ function toggleIgnore(id: string): void {
     const label = chatItem ? `"${escapeHtml(chatDisplayName(chatItem))}"` : "Container"
     const statusEl = document.getElementById("status")
     if (statusEl) {
-      statusEl.innerHTML = `${label} ignored. <button class="link-button" id="undo-ignore">Undo</button>`
+      statusEl.innerHTML = `${label} hidden. <button class="link-button" id="undo-ignore">Undo</button>`
       const undoBtn = document.getElementById("undo-ignore")
       if (undoBtn) {
         undoBtn.addEventListener("click", () => {
@@ -2172,7 +2464,7 @@ function clearAllIgnored(): void {
   saveIgnored(userCacheKey(), ignoredIds)
   rerenderContainerList()
   scheduleOneDriveSave()
-  setStatus(`Cleared ${count} ignored container${count === 1 ? "" : "s"}.`)
+  setStatus(`Cleared ${count} hidden item${count === 1 ? "" : "s"}.`)
 }
 
 function updateTypeCountChips(): void {
@@ -2215,6 +2507,9 @@ function revealPostLoadSections(): void {
   const dl = document.getElementById("section-download")
   if (view) view.hidden = false
   if (dl) dl.hidden = false
+  // hkh: reveal the persistent list bar (Flat/Grouped toggle) with the results.
+  const bar = document.getElementById("list-bar")
+  if (bar) bar.hidden = false
 }
 
 /** §1 collapses to a one-line RECEIPT, and §2/§3 are revealed. */
@@ -2320,6 +2615,7 @@ function reloadChatsWithCurrentSettings(): void {
   recordingsMap = new Map()
   channelsState = { containers: [] }
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelActivityMap.clear()
   availableTeams = [] // force team re-enumeration on next load
   channelWindowStamp++
@@ -2582,6 +2878,7 @@ async function refreshChats(): Promise<void> {
   recordingsMap = new Map()
   channelsState = { containers: [] }
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelWindowStamp++
   await initialLoadChats()
 }
@@ -2664,6 +2961,7 @@ async function backgroundLoadChannels(fromMs: number, toMs: number): Promise<voi
   channelWindowStamp++
   channelActivityStamp = channelWindowStamp
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelActivityMap.clear()
   const stamp = channelWindowStamp
 
@@ -2835,10 +3133,8 @@ function buildChannelSubLine(
   preview: ChannelPreviewEntry | undefined,
   activityMs: number | null | undefined,
 ): string {
-  const lastSync = chatPrefs[channel.id]?.lastSync
-  const dlStatus = lastSync
-    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
-    : "Not downloaded yet"
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (rendered by renderChannelRowHtml, both view modes).
   if (preview?.status === "error") {
     return `Channel \u00b7 ${channel.teamName} \u00b7 ${preview.errorMessage ?? "Error"}`
   }
@@ -2850,7 +3146,7 @@ function buildChannelSubLine(
   } else {
     activityLabel = `last activity ${formatDate(new Date(activityMs).toISOString())}`
   }
-  return `Channel \u00b7 ${channel.teamName} \u00b7 ${activityLabel} \u00b7 ${dlStatus}`
+  return `Channel \u00b7 ${channel.teamName} \u00b7 ${activityLabel}`
 }
 
 /** HTML for the expanded body of a channel row: group header + up to 5 preview
@@ -2906,37 +3202,25 @@ function renderChannelThreadRows(
     const dateStr = thread.createdDateTime ? formatDate(thread.createdDateTime) : "\u2014"
     const replyCount = thread.replies.length
     const subText = `${thread.author} \u00b7 ${dateStr} \u00b7 ${replyCount} repl${replyCount !== 1 ? "ies" : "y"}`
-    html += `
-      <div class="artifact-row" data-thread-root-id="${escapeHtml(thread.rootId)}" data-channel-id="${escapeHtml(chanId)}">
-        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
-        <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
-        <div class="artifact-info">
+    const threadInfo = `<div class="artifact-info">
           <div class="artifact-name">${escapeHtml(thread.subject)}</div>
           <div class="artifact-sub">${escapeHtml(subText)}</div>
-        </div>
-        <button class="artifact-download channel-thread-download"
-          data-channel-id="${escapeHtml(chanId)}"
-          data-thread-root-id="${escapeHtml(thread.rootId)}"
-          title="Download this thread"
-          aria-label="Download thread: ${escapeHtml(thread.subject)}"><span aria-hidden="true">\u2b07</span></button>
-      </div>
+        </div>`
+    const threadActions = `<button class="artifact-download channel-thread-download" data-channel-id="${escapeHtml(chanId)}" data-thread-root-id="${escapeHtml(thread.rootId)}" title="Download this thread" aria-label="Download thread: ${escapeHtml(thread.subject)}"><span aria-hidden="true">\u2b07</span></button>`
+    html += `
+      <div class="artifact-row ac-row" data-thread-root-id="${escapeHtml(thread.rootId)}" data-channel-id="${escapeHtml(chanId)}">${acRowCells({ icon: `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>`, info: threadInfo, actions: threadActions })}</div>
     `
   }
 
   // Tail row when there are more than 5 threads in window.
   // NO number in the label per spec ("and more…", not "and N more").
   if (preview.total > 5 || preview.truncated) {
-    html += `
-      <div class="artifact-row channel-tail-row" data-channel-id="${escapeHtml(chanId)}">
-        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
-        <div class="artifact-info">
+    const tailInfo = `<div class="artifact-info">
           <div class="artifact-sub">and more\u2026</div>
-        </div>
-        <button class="artifact-download channel-download-all"
-          data-channel-id="${escapeHtml(chanId)}"
-          title="Download all threads in window"
-          aria-label="Download all threads in window"><span aria-hidden="true">\u2b07</span> Download all</button>
-      </div>
+        </div>`
+    const tailActions = `<button class="artifact-download channel-download-all" data-channel-id="${escapeHtml(chanId)}" title="Download all threads in window" aria-label="Download all threads in window"><span aria-hidden="true">\u2b07</span> Download all</button>`
+    html += `
+      <div class="artifact-row channel-tail-row ac-row" data-channel-id="${escapeHtml(chanId)}">${acRowCells({ info: tailInfo, actions: tailActions })}</div>
     `
   }
 
@@ -2973,45 +3257,42 @@ function renderChannelRowHtml(
     // The download button (artifact-download + data-channel-id) is also wired there.
     // The checkbox (channel-select-check) is wired by wireChannelListeners too.
     const sub = buildChannelSubLine(channel, preview, activityMs)
-    return `
-    <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">
-      <input type="checkbox" class="artifact-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} aria-label="Select ${escapeHtml(name)} for bulk download">
-      <button class="fav-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel \u2014 always shown and synced on every Sync"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>
-      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
-      <div class="artifact-info">
+    const checkbox = `<input type="checkbox" class="artifact-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} aria-label="Select ${escapeHtml(name)} for bulk download">`
+    const favorite = `<button class="fav-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel \u2014 always shown and synced on every Sync"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>`
+    const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>`
+    const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(name)}</div>
         <div class="artifact-sub">${escapeHtml(sub)}</div>
-      </div>
-      <button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>
-    </li>
+      </div>`
+    // 4qr: flat/single channel rows carry a hide toggle too.
+    const hideBtn = hideToggleHtml("channel", channelId, isIgnored)
+    const actions = `${hideBtn}${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
+    return `
+    <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""} ac-row" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</li>
   `
   }
 
   // Grouped view: keep the existing container chrome (matches renderContainerRow neighbours).
   const isExpanded = expandedChannelIds.has(channelId)
-  return `
-    <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
-      <div class="chat-row-header">
-        <button class="expand-toggle channel-expand-toggle"
-          data-channel-id="${escapeHtml(channelId)}"
-          aria-expanded="${isExpanded ? "true" : "false"}"
-          title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
-        <input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">
-        <span class="fav-state${isFav ? " favorited" : ""}" title="${isFav ? "Favorited \u2014 expand to change" : "Not favorited \u2014 expand to favorite"}" aria-label="${isFav ? "Favorited" : "Not favorited"}">${isFav ? "\u2605" : "\u2606"}</span>
-        <div class="chat-info">
+  const caret = `<button class="expand-toggle channel-expand-toggle" data-channel-id="${escapeHtml(channelId)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
+  const checkbox = `<input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">`
+  // 81x: the collapsed channel header star is now a real toggle (was a read-only
+  // .fav-state span). Channels have a single stream, so it simply toggles the
+  // channel favorite via toggleChannelFavorite() (wired by the shared channel
+  // .fav-toggle[data-stream="channel"] listener).
+  const favorite = `<button class="fav-toggle fav-header-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>`
+  const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(buildChannelSubLine(channel, preview, activityMs))}</div>
-        </div>
-        ${renderThreadIndicator(preview)}
-        <button class="ignore-toggle${isIgnored ? " ignored" : ""}"
-          data-channel-id="${escapeHtml(channelId)}"
-          title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}"
-          aria-label="${isIgnored ? "Un-ignore" : "Ignore"}"
-          aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-        <button class="container-action"
-          data-channel-id="${escapeHtml(channelId)}"
-          aria-label="Download threads for ${escapeHtml(name)}">Download</button>
-      </div>
+        </div>`
+  const actions =
+    `${renderThreadIndicator(preview)}` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Unhide this channel" : "Hide this channel"}" aria-label="${isIgnored ? "Unhide" : "Hide"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}` +
+    `<button class="container-action artifact-download" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}" title="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
+  return `
+    <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
+      <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
       <div class="artifact-rows channel-artifact-rows"${isExpanded ? "" : " hidden"}>
         ${renderChannelThreadRows(channel, preview)}
       </div>
@@ -3132,19 +3413,44 @@ function renderTeamPicker(): void {
 
   const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
   const hasSelection = selectedTeamSet.size > 0
+  const selectedNames = availableTeams
+    .filter((t) => selectedTeamSet.has(t.id))
+    .map((t) => t.displayName)
 
-  let html = `<span class="label">Teams\u00a0(channels):</span><span class="chips team-chips">`
-  for (const team of availableTeams) {
-    const active = selectedTeamSet.has(team.id)
-    html += `<button class="chip${active ? " active" : ""}" data-team-id="${escapeHtml(team.id)}" title="${escapeHtml(active ? `Deselect ${team.displayName}` : `Include channels from ${team.displayName}`)}">${escapeHtml(team.displayName)}</button>`
-  }
-  html += `</span>`
+  let html = `<span class="label">Teams\u00a0(channels):</span>`
 
-  if (!hasSelection) {
-    html += `<span class="channel-hint">Pick a team above to include its channels in the list.</span>`
+  if (teamPickerCollapsed) {
+    // nhk: collapsed to a selected-summary — team names, or "N teams" when >3 —
+    // with an Edit control to expand.
+    let summary: string
+    if (!hasSelection) summary = "None selected"
+    else if (selectedNames.length <= 3) summary = selectedNames.join(", ")
+    else summary = `${selectedNames.length} teams`
+    html += `<span class="team-summary" title="${escapeHtml(hasSelection ? selectedNames.join(", ") : "No teams selected")}">${escapeHtml(summary)}</span>`
+    html += `<button class="chip team-picker-edit" id="team-picker-toggle" aria-expanded="false" title="Edit team selection">Edit</button>`
+  } else {
+    html += `<span class="chips team-chips">`
+    for (const team of availableTeams) {
+      const active = selectedTeamSet.has(team.id)
+      html += `<button class="chip${active ? " active" : ""}" data-team-id="${escapeHtml(team.id)}" title="${escapeHtml(active ? `Deselect ${team.displayName}` : `Include channels from ${team.displayName}`)}">${escapeHtml(team.displayName)}</button>`
+    }
+    html += `</span>`
+    html += `<button class="chip team-picker-edit" id="team-picker-toggle" aria-expanded="true" title="Collapse team selection">Done</button>`
+    if (!hasSelection) {
+      html += `<span class="channel-hint">Pick a team above to include its channels in the list.</span>`
+    }
   }
 
   field.innerHTML = html
+
+  const toggleBtn = field.querySelector<HTMLButtonElement>("#team-picker-toggle")
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      teamPickerCollapsed = !teamPickerCollapsed
+      saveUIPrefs()
+      renderTeamPicker()
+    })
+  }
 
   field.querySelectorAll<HTMLButtonElement>(".chip[data-team-id]").forEach((btn) => {
     btn.addEventListener("click", () => {

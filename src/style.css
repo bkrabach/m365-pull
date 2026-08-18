@@ -542,9 +542,11 @@ header {
   flex-shrink: 0;
 }
 
-/* Recordings indicator in container rows (🎙 N) */
+/* Recordings indicator in container rows (🎙 N); message-count badge (💬 N)
+ * and thread-count badge (📬 N) share the same chrome. */
 .rec-indicator,
-.thread-indicator {
+.thread-indicator,
+.msg-indicator {
   flex-shrink: 0;
   font-size: 0.78rem;
   color: var(--muted);
@@ -989,6 +991,21 @@ header {
   cursor: progress;
 }
 
+/* hkh: persistent list bar directly above the results, holding the Flat/Grouped
+ * toggle (moved out of the VIEW toolbar section so it sits right by the list). */
+.list-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.list-bar .label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 /* Change 3: Grouped/Flat segmented view toggle in the toolbar. */
 .view-toggle {
   display: inline-flex;
@@ -1019,10 +1036,10 @@ header {
   color: white;
 }
 
-/* Change 3: flat-view rows are top-level <li> artifacts (no deep indent). */
+/* Change 3: flat-view rows are top-level <li> artifacts (no deep indent).
+ * Layout (padding/columns) now comes from the shared `.ac-row` grid; this rule
+ * only carries the flat-list divider. */
 .artifact-row.artifact-flat {
-  padding: 0.5rem 1rem;
-  gap: 0.75rem;
   border-bottom: 1px solid var(--border);
 }
 .artifact-row.artifact-flat:last-child {
@@ -1057,6 +1074,116 @@ header {
 .chat-row.ignored {
   background: linear-gradient(to right, rgba(107, 114, 128, 0.06), transparent 80%);
   opacity: 0.75;
+}
+
+/* ===== STEP 0: shared row grid (acRowCells) =====
+ * One fixed column template shared by EVERY list row — grouped chat/channel
+ * header, flat rows, grouped child rows, group sub-headers, channel thread/tail
+ * rows — so their columns line up regardless of which slots are filled:
+ *   [caret][checkbox][favorite][type-icon][info (1fr)][right actions]
+ * Empty slots render a `.ac-slot` spacer so the column is still reserved. */
+.ac-row {
+  display: grid;
+  grid-template-columns: 28px 1rem 1.6rem 1.25rem minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 0.65rem;
+  padding: 0.5rem 1rem;
+}
+.ac-slot {
+  display: block;
+  min-width: 0;
+}
+/* Right-side action cluster occupies the trailing auto column. */
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  justify-self: end;
+}
+/* Inside the shared cluster the download button no longer needs the old
+ * flex-row margin-left:auto (the cluster itself is right-justified). */
+.row-actions .artifact-download {
+  margin-left: 0;
+}
+
+/* nxq: download-status label in the right action cluster (just left of the
+ * download button), replacing the old inline "· Downloaded {date}" sub-line. */
+.dl-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.dl-label.not-downloaded {
+  font-style: italic;
+  opacity: 0.75;
+}
+
+/* 4qr: hidden-items management panel (shown at the top of the list when
+ * "Show hidden" is on). Lists every hidden chat/channel with a per-item Unhide. */
+.hidden-items-panel {
+  display: block;
+  padding: 0.5rem 1rem 0.6rem;
+  background: var(--bg);
+  border-bottom: 2px solid var(--border);
+}
+.hidden-items-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+.hidden-items-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.hidden-item {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.2rem 0;
+}
+.hidden-item-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+.unhide-btn {
+  flex-shrink: 0;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms;
+}
+.unhide-btn:hover {
+  background: var(--row-hover);
+  border-color: var(--accent);
+}
+
+/* nhk: collapsed Teams-picker summary + Edit control. */
+.team-summary {
+  font-size: 0.85rem;
+  color: var(--fg);
+  max-width: 22rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.team-picker-edit {
+  flex-shrink: 0;
 }
 
 /* "Show ignored" chip in the filter bar */
