@@ -15,6 +15,11 @@ export interface UIState {
     sortKey: SortKey
     markedOnly: boolean
     showIgnored: boolean
+    // dzo: top-level item-kind view filters (default all ON). Optional for
+    // back-compat with previously-persisted state.
+    showChats?: boolean
+    showChannels?: boolean
+    showRecordings?: boolean
   }
   recordingFilter?: {
     search: string

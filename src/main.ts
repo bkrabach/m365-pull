@@ -146,6 +146,13 @@ interface FilterState {
   sortKey: SortKey
   markedOnly: boolean
   showIgnored: boolean
+  // dzo: top-level item-kind view filters (default all ON), persisted in
+  // ui-state chatFilter. Applied in applyContainerFiltersAndSort (chats) and the
+  // channel path of rerenderContainerList (channels), plus per-row message/
+  // recording gating.
+  showChats: boolean
+  showChannels: boolean
+  showRecordings: boolean
 }
 
 type SyncStatus = "idle" | "syncing" | "synced" | "error" | "offline"
@@ -200,6 +207,9 @@ let filterState: FilterState = {
   sortKey: "marked-first",
   markedOnly: false,
   showIgnored: false,
+  showChats: true,
+  showChannels: true,
+  showRecordings: true,
 }
 let markedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
@@ -826,6 +836,17 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     }
     if (!filterState.enabledTypes.has(c.chatType)) return false
     if (filterState.markedOnly && !isChatFavorited(c.id)) return false
+    // dzo: item-kind view filters (chat path). A chat contributes a messages
+    // artifact and/or recordings; drop it entirely when neither would show given
+    // the current Chats/Recordings toggles. Per-row gating (below, in the render
+    // builders) hides the individual message vs recording rows.
+    {
+      const rc = recordingsMap.get(c.id)
+      const hasRec = !!rc && rc.recordings.length > 0
+      const chatMsgVisible = filterState.showChats && loadIncludeMessages
+      const chatRecVisible = filterState.showRecordings && hasRec
+      if (!chatMsgVisible && !chatRecVisible) return false
+    }
     // Build B: Messages OFF => recordings-only. A chat with no recording has
     // nothing to show in this scope, so filter it out. (Until the recording scan
     // lands, no chat has a recording yet — but §2/§3 aren't revealed until the
@@ -859,6 +880,18 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     })
   }
   return result
+}
+
+/** dzo: message artifact rows are visible when messages were loaded AND the
+ * "Chats" view filter is on. (Download scope + selection still follow the load
+ * flags, not the view filter.) */
+function messageRowsVisible(): boolean {
+  return loadIncludeMessages && filterState.showChats
+}
+/** dzo: recording artifact rows/badges are visible when the "Recordings" view
+ * filter is on. */
+function recordingRowsVisible(): boolean {
+  return filterState.showRecordings
 }
 
 function countByType(chats: TeamsChatItem[]): Map<string, number> {
@@ -1015,6 +1048,12 @@ function render(): void {
               <button class="seg" id="view-flat" data-view="flat" title="Flat \\u2014 every artifact (messages + each recording) as its own row">Flat</button>
               <button class="seg" id="view-grouped" data-view="grouped" title="Grouped \\u2014 chat rows that expand into their artifacts">Grouped</button>
             </span>
+          </span>
+          <span class="field">
+            <span class="label">Show:</span>
+            <button class="chip active" id="filter-chats" title="Show chat messages">Chats</button>
+            <button class="chip active" id="filter-channels" title="Show channels">Channels</button>
+            <button class="chip active" id="filter-recordings" title="Show recordings">Recordings</button>
           </span>
           <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
           <button class="chip" id="hide-downloaded">Hide downloaded</button>
@@ -1252,6 +1291,21 @@ function wireGlobalHandlers(account: AccountInfo): void {
     saveUIPrefs()
   })
 
+  // dzo: item-kind view filters (Chats / Channels / Recordings, default all ON).
+  const wireKindFilter = (id: string, get: () => boolean, set: (v: boolean) => void) => {
+    const btn = document.getElementById(id) as HTMLButtonElement | null
+    if (!btn) return
+    btn.addEventListener("click", () => {
+      set(!get())
+      btn.classList.toggle("active", get())
+      rerenderContainerList()
+      saveUIPrefs()
+    })
+  }
+  wireKindFilter("filter-chats", () => filterState.showChats, (v) => (filterState.showChats = v))
+  wireKindFilter("filter-channels", () => filterState.showChannels, (v) => (filterState.showChannels = v))
+  wireKindFilter("filter-recordings", () => filterState.showRecordings, (v) => (filterState.showRecordings = v))
+
   // Show ignored toggle
   el<HTMLButtonElement>("showignored").addEventListener("click", () => {
     filterState.showIgnored = !filterState.showIgnored
@@ -1327,6 +1381,9 @@ function saveUIPrefs(): void {
       sortKey: filterState.sortKey,
       markedOnly: filterState.markedOnly,
       showIgnored: filterState.showIgnored,
+      showChats: filterState.showChats,
+      showChannels: filterState.showChannels,
+      showRecordings: filterState.showRecordings,
     },
   })
 }
@@ -1344,6 +1401,9 @@ function hydrateUIStateFromStorage(): void {
       sortKey: saved.chatFilter.sortKey ?? "marked-first",
       markedOnly: saved.chatFilter.markedOnly ?? false,
       showIgnored: saved.chatFilter.showIgnored ?? false,
+      showChats: saved.chatFilter.showChats ?? true,
+      showChannels: saved.chatFilter.showChannels ?? true,
+      showRecordings: saved.chatFilter.showRecordings ?? true,
     }
   }
 }
@@ -1364,6 +1424,16 @@ function syncUIControlsFromState(): void {
   if (markedOnlyChat) markedOnlyChat.classList.toggle("active", filterState.markedOnly)
   const showIgnoredBtn = document.getElementById("showignored")
   if (showIgnoredBtn) showIgnoredBtn.classList.toggle("active", filterState.showIgnored)
+  // dzo: item-kind view filter chips
+  const kindFilters: [string, boolean][] = [
+    ["filter-chats", filterState.showChats],
+    ["filter-channels", filterState.showChannels],
+    ["filter-recordings", filterState.showRecordings],
+  ]
+  for (const [id, on] of kindFilters) {
+    const btn = document.getElementById(id)
+    if (btn) btn.classList.toggle("active", on)
+  }
   document
     .querySelectorAll<HTMLButtonElement>("#type-chips .chip[data-type]")
     .forEach((chip) => {
@@ -1383,6 +1453,8 @@ function rerenderContainerList(): void {
   const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
   const q = filterState.search.trim().toLowerCase()
   const visibleChannels: ChannelContainer[] = channelsState.containers.filter((c) => {
+    // dzo: channel view-filter toggle (channel path).
+    if (!filterState.showChannels) return false
     if (selectedTeamSet.size === 0 || !selectedTeamSet.has(c.teamId)) return false
     const isIgnored = ignoredIds.has(c.id)
     if (filterState.showIgnored) return isIgnored
@@ -1784,7 +1856,7 @@ function renderContainerRow(
   // Phase 1 recording indicator: only show badge when recordings are confirmed.
   // All other states (pending, none, unknown) = silence ("no-recording = silence" design).
   let recIndicatorHtml = ""
-  if (recContainer !== undefined && recContainer.recordings.length > 0) {
+  if (recContainer !== undefined && recContainer.recordings.length > 0 && recordingRowsVisible()) {
     const n = recContainer.recordings.length
     const truncNote = recContainer.truncated ? " (may be incomplete)" : ""
     recIndicatorHtml = `<span class="rec-indicator" aria-label="${n} recording${n !== 1 ? "s" : ""}${truncNote}" title="${n} recording${n !== 1 ? "s" : ""} in range${truncNote}"><span aria-hidden="true">\uD83C\uDF99 ${n}</span></span>`
@@ -1960,7 +2032,7 @@ function renderArtifactRows(
   recContainer: RecordingContainer | undefined,
 ): string {
   // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
-  let html = loadIncludeMessages ? messagesArtifactRowHtml(chat, "grouped") : ""
+  let html = messageRowsVisible() ? messagesArtifactRowHtml(chat, "grouped") : ""
 
   if (recContainer && recContainer.recordings.length > 0) {
     const n = recContainer.recordings.length
@@ -1988,6 +2060,9 @@ function renderArtifactRows(
  * recordings at render (the original bug), they're surfaced as "orphans" \u2014
  * a fail-loud safety net. Excludes empty containers (nothing to render). */
 function getOrphanRecordingContainers(chats: TeamsChatItem[]): RecordingContainer[] {
+  // dzo: orphan recordings are recordings; hide them when the Recordings view
+  // filter is off.
+  if (!recordingRowsVisible()) return []
   const chatIds = new Set(chats.map((c) => c.id))
   return [...recordingsMap.values()].filter(
     (c) => !chatIds.has(c.chatId) && c.recordings.length > 0,
@@ -2103,14 +2178,14 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
     // interleave with other items that happened between those weeks.
     const items: { ms: number; html: string }[] = []
     for (const chat of chats) {
-      if (loadIncludeMessages) {
+      if (messageRowsVisible()) {
         items.push({
           ms: chatActivityDate(chat),
           html: messagesArtifactRowHtml(chat, "flat"),
         })
       }
       const rc = recordingsMap.get(chat.id)
-      if (rc && rc.recordings.length > 0) {
+      if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
         for (const rec of rc.recordings) {
           items.push({
             ms: new Date(rec.eventCreatedDateTime).getTime(),
@@ -2147,7 +2222,7 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
     // per-artifact timestamps as the "recent" branch above).
     const items: { fav: boolean; ms: number; html: string }[] = []
     for (const chat of chats) {
-      if (loadIncludeMessages) {
+      if (messageRowsVisible()) {
         items.push({
           fav: isMessagesFavorited(chat.id),     // messages-stream key = bare chatId
           ms: chatActivityDate(chat),
@@ -2155,7 +2230,7 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
         })
       }
       const rc = recordingsMap.get(chat.id)
-      if (rc && rc.recordings.length > 0) {
+      if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
         for (const rec of rc.recordings) {
           items.push({
             fav: isRecordingsFavorited(chat.id), // recordings-stream key (per recStreamKey)
@@ -2196,9 +2271,9 @@ function renderFlatArtifactRows(chats: TeamsChatItem[], channels: ChannelContain
   const blocks: { name: string; html: string }[] = []
   for (const chat of chats) {
     const chatHtmls: string[] = []
-    if (loadIncludeMessages) chatHtmls.push(messagesArtifactRowHtml(chat, "flat"))
+    if (messageRowsVisible()) chatHtmls.push(messagesArtifactRowHtml(chat, "flat"))
     const rc = recordingsMap.get(chat.id)
-    if (rc && rc.recordings.length > 0) {
+    if (rc && rc.recordings.length > 0 && recordingRowsVisible()) {
       for (const rec of rc.recordings) {
         chatHtmls.push(recordingArtifactRowHtml(chat, rec, "flat"))
       }
