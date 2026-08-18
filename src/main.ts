@@ -124,6 +124,20 @@ interface ChannelPreviewEntry {
   windowStamp: number
 }
 
+/** aws: per-chat in-window message COUNT state — a lazy, bounded, tri-state
+ * badge mirroring the channel thread-count pattern (ChannelPreviewEntry /
+ * ensureChannelPreview / renderThreadIndicator). Populated on first chat expand,
+ * never eagerly at render for every chat. */
+interface ChatCountEntry {
+  status: "loading" | "resolved" | "error"
+  count: number
+  /** true when the bounded page cap was hit before the window was exhausted
+   * (rendered as "N+"). */
+  truncated: boolean
+  /** Window stamp when fetched; stale if != channelWindowStamp. */
+  windowStamp: number
+}
+
 type SortKey = "marked-first" | "recent" | "name"
 
 interface FilterState {
@@ -171,6 +185,9 @@ let availableTeams: TeamInfo[] = []
 const channelActivityMap: Map<string, number | null> = new Map()
 /** Matches channelWindowStamp — stale activity resolutions are discarded when they differ. */
 let channelActivityStamp = 0
+/** aws: per-chat in-window message count state (lazy, on first expand). Keyed by
+ * chatId. Cleared alongside channelPreviewMap whenever the window changes. */
+let chatMessageCountMap: Map<string, ChatCountEntry> = new Map()
 /** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
 let recordingsMap: Map<string, RecordingContainer> = new Map()
 /** True while the background recordings scan is running; rows show pending indicator. */
@@ -1473,6 +1490,9 @@ function rerenderContainerList(): void {
           btn.textContent = "\u25be"
           btn.title = "Collapse artifacts"
           li.classList.add("expanded")
+          // aws: lazily resolve the in-window message count on first expand
+          // (never eagerly for every chat at render).
+          void ensureChatMessageCount(chatId)
         }
       })
     })
@@ -1623,6 +1643,75 @@ function downloadedLabelHtml(lastSync: string | number | undefined): string {
   return `<span class="dl-label${downloaded ? " downloaded" : " not-downloaded"}">${escapeHtml(text)}</span>`
 }
 
+/** aws: bounded page cap for the lazy in-window message count. If the window
+ * still has messages beyond this many, the badge renders "N+". Keeps the count
+ * cheap — we never page an entire chat just to badge it. */
+const CHAT_COUNT_PAGE_CAP = 200
+
+/** aws: the in-window message-count badge for a chat (grouped rows), mirroring
+ * the channel thread badge (renderThreadIndicator). Returns "" until the count
+ * has actually been requested (first expand) or if the cached entry is stale for
+ * the current window — we never trigger a fetch from render. */
+function renderMessageIndicator(chatId: string): string {
+  const entry = chatMessageCountMap.get(chatId)
+  if (!entry || entry.windowStamp !== channelWindowStamp) return ""
+  if (entry.status === "loading") {
+    return `<span class="msg-indicator pending" aria-label="Message count loading"><span aria-hidden="true">\uD83D\uDCAC \u2026</span></span>`
+  }
+  if (entry.status === "error") return ""
+  const n = entry.count
+  const label = entry.truncated ? `${n}+` : String(n)
+  return `<span class="msg-indicator" aria-label="${label} message${n !== 1 ? "s" : ""} in range" title="${label} message${n !== 1 ? "s" : ""} in range"><span aria-hidden="true">\uD83D\uDCAC ${escapeHtml(label)}</span></span>`
+}
+
+/** aws: fetch and cache a chat's in-window message COUNT (lazy, on first expand).
+ * Mirrors ensureChannelPreview: dedupes in-flight/resolved entries, stamps with
+ * the current window, discards superseded results, and re-renders on state
+ * change. Bounded by CHAT_COUNT_PAGE_CAP so a chat is never fully paginated just
+ * to show a badge; hitting the cap renders as "N+". */
+async function ensureChatMessageCount(chatId: string): Promise<void> {
+  const stamp = channelWindowStamp
+  const existing = chatMessageCountMap.get(chatId)
+  if (
+    existing &&
+    existing.windowStamp === stamp &&
+    (existing.status === "loading" || existing.status === "resolved")
+  ) {
+    return
+  }
+  chatMessageCountMap.set(chatId, {
+    status: "loading",
+    count: 0,
+    truncated: false,
+    windowStamp: stamp,
+  })
+  rerenderContainerList()
+
+  const { fromMs } = getChannelWindow()
+  try {
+    const msgs = await fetchChatMessages(msal, chatId, {
+      since: new Date(fromMs),
+      maxMessages: CHAT_COUNT_PAGE_CAP,
+    })
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    chatMessageCountMap.set(chatId, {
+      status: "resolved",
+      count: msgs.length,
+      truncated: msgs.length >= CHAT_COUNT_PAGE_CAP,
+      windowStamp: stamp,
+    })
+  } catch {
+    if (channelWindowStamp !== stamp) return // window changed — discard
+    chatMessageCountMap.set(chatId, {
+      status: "error",
+      count: 0,
+      truncated: false,
+      windowStamp: stamp,
+    })
+  }
+  rerenderContainerList()
+}
+
 function renderContainerRow(
   chat: TeamsChatItem,
   recContainer: RecordingContainer | undefined,
@@ -1689,6 +1778,7 @@ function renderContainerRow(
           <div class="chat-sub">${escapeHtml(sub)}</div>
         </div>`
   const actions =
+    `${renderMessageIndicator(chat.id)}` +
     `${recIndicatorHtml}` +
     `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
     `${downloadedLabelHtml(lastSync)}` +
@@ -2372,6 +2462,7 @@ function reloadChatsWithCurrentSettings(): void {
   recordingsMap = new Map()
   channelsState = { containers: [] }
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelActivityMap.clear()
   availableTeams = [] // force team re-enumeration on next load
   channelWindowStamp++
@@ -2634,6 +2725,7 @@ async function refreshChats(): Promise<void> {
   recordingsMap = new Map()
   channelsState = { containers: [] }
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelWindowStamp++
   await initialLoadChats()
 }
@@ -2716,6 +2808,7 @@ async function backgroundLoadChannels(fromMs: number, toMs: number): Promise<voi
   channelWindowStamp++
   channelActivityStamp = channelWindowStamp
   channelPreviewMap = new Map()
+  chatMessageCountMap = new Map() // aws: chat message counts are window-scoped too
   channelActivityMap.clear()
   const stamp = channelWindowStamp
 

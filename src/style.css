@@ -542,9 +542,11 @@ header {
   flex-shrink: 0;
 }
 
-/* Recordings indicator in container rows (🎙 N) */
+/* Recordings indicator in container rows (🎙 N); message-count badge (💬 N)
+ * and thread-count badge (📬 N) share the same chrome. */
 .rec-indicator,
-.thread-indicator {
+.thread-indicator,
+.msg-indicator {
   flex-shrink: 0;
   font-size: 0.78rem;
   color: var(--muted);
