@@ -2011,9 +2011,11 @@ function recordingArtifactRowHtml(
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const recFav = isRecordingsFavorited(chatId)
-  const favBtn = flat
-    ? `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
-    : ""
+  // 84b: the recordings-stream favorite star lives on the recording rows in BOTH
+  // views now (the "Recordings (N)" group sub-header is a plain count label, no
+  // star). Toggling any recording row's star toggles the one shared recordings
+  // stream (all rows re-render in sync).
+  const favBtn = `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
   const nameRaw = flat ? chatName : `Recording \u2014 ${dateLabel}`
   const subRaw = flat
     ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}`
@@ -2027,11 +2029,11 @@ function recordingArtifactRowHtml(
   // 4qr: flat/single recording rows carry a hide toggle (hides the owning chat).
   const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
   const actions = `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
-  // kkc: grouped recording rows reserve an EMPTY favorite slot (favBtn === "")
-  // so their checkbox\u2192type-icon gap matches message rows; flat rows carry the
-  // shared recordings-stream \u2605.
+  // kkc + 84b: every recording row (grouped and flat) fills the favorite column
+  // with the shared recordings-stream \u2605, so the checkbox\u2192type-icon gap matches
+  // message/chat rows and the column still aligns.
   return `
-    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite: favBtn || undefined, icon, info, actions })}</${tag}>
+    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite: favBtn, icon, info, actions })}</${tag}>
   `
 }
 
@@ -2047,12 +2049,13 @@ function renderArtifactRows(
   if (recContainer && recContainer.recordings.length > 0) {
     const n = recContainer.recordings.length
     const chatId = chat.id
-    const recFav = isRecordingsFavorited(chatId)
-    // Recordings-stream favorite lives on a group header (the stream is the unit;
-    // individual recordings are immutable and not separately favoritable).
-    const recFavBtn = `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
+    // 84b: the "Recordings (N)" sub-header is a plain count LABEL now — the stray
+    // greyed \u2606 (which looked non-favoritable on a section header) is gone. The
+    // recordings-stream favorite \u2605 lives on the recording rows themselves (see
+    // recordingArtifactRowHtml), where it reads as an interactive control and
+    // still toggles the one shared recordings stream.
     html += `
-      <div class="artifact-group-header ac-row" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ favorite: recFavBtn, info: `<span class="artifact-group-label">Recordings (${n})</span>` })}</div>
+      <div class="artifact-group-header ac-row" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ info: `<span class="artifact-group-label">Recordings (${n})</span>` })}</div>
     `
     for (const rec of recContainer.recordings) {
       html += recordingArtifactRowHtml(chat, rec, "grouped")
