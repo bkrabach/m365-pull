@@ -1638,21 +1638,20 @@ function renderContainerRow(
   const wantMessages = loadIncludeMessages
   const hasRecordings = recContainer !== undefined && recContainer.recordings.length > 0
   const wantRecordings = loadIncludeRecordings && hasRecordings
-  let downloadBtnInner: string
+  // kkc: group download button is now the same icon-only \u2b07 as the per-row
+  // download buttons (emoji/text labels stripped); the aria-label still carries
+  // the full scope, and the disabled/"nothing to download" state is preserved.
+  const downloadBtnInner = `<span aria-hidden="true">\u2b07</span>`
   let downloadBtnDisabled = ""
   let downloadBtnTitle = ""
   let downloadBtnAriaLabel: string
   if (wantMessages && wantRecordings) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC\uD83C\uDF99</span>`
     downloadBtnAriaLabel = "Download messages and recordings"
   } else if (wantMessages) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83D\uDCAC</span>`
     downloadBtnAriaLabel = "Download messages"
   } else if (wantRecordings) {
-    downloadBtnInner = `Download <span aria-hidden="true">\uD83C\uDF99</span>`
     downloadBtnAriaLabel = "Download recordings"
   } else {
-    downloadBtnInner = "Download"
     downloadBtnDisabled = " disabled"
     downloadBtnTitle = ` title="Nothing to download for current Include settings"`
     downloadBtnAriaLabel = "Download \u2014 nothing to download for current Include settings"
@@ -1675,7 +1674,7 @@ function renderContainerRow(
   const actions =
     `${recIndicatorHtml}` +
     `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
-    `<button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
+    `<button class="container-action artifact-download"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
   return `
     <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
       <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
@@ -3024,7 +3023,7 @@ function renderChannelRowHtml(
   const actions =
     `${renderThreadIndicator(preview)}` +
     `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
-    `<button class="container-action" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}">Download</button>`
+    `<button class="container-action artifact-download" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}" title="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
   return `
     <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
       <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
