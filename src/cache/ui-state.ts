@@ -9,6 +9,9 @@ export interface UIState {
   currentSource?: string
   /** Chats source: lookback dropdown value (controls message-download depth, not list range) */
   lookback?: string
+  /** nhk: whether the Teams (channels) picker is collapsed to a selected-summary
+   * (per-device UI preference). */
+  teamPickerCollapsed?: boolean
   chatFilter?: {
     search: string
     enabledTypes: string[]

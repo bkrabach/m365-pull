@@ -1158,6 +1158,19 @@ header {
   border-color: var(--accent);
 }
 
+/* nhk: collapsed Teams-picker summary + Edit control. */
+.team-summary {
+  font-size: 0.85rem;
+  color: var(--fg);
+  max-width: 22rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.team-picker-edit {
+  flex-shrink: 0;
+}
+
 /* "Show ignored" chip in the filter bar */
 .chip.show-ignored.active {
   background: #6b7280;

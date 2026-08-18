@@ -211,6 +211,9 @@ let filterState: FilterState = {
   showChannels: true,
   showRecordings: true,
 }
+/** nhk: whether the Teams (channels) picker is collapsed to a selected-summary.
+ * Persisted per-device in ui-state. Defaults to collapsed. */
+let teamPickerCollapsed = true
 let markedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
@@ -1375,6 +1378,7 @@ function saveUIPrefs(): void {
     | null
   saveUIState(userCacheKey(), {
     lookback: lookbackEl?.value,
+    teamPickerCollapsed,
     chatFilter: {
       search: filterState.search,
       enabledTypes: [...filterState.enabledTypes],
@@ -1392,6 +1396,7 @@ function saveUIPrefs(): void {
  * Runs after the HTML is rendered (handlers wired later read these values). */
 function hydrateUIStateFromStorage(): void {
   const saved = loadUIState(userCacheKey())
+  if (saved.teamPickerCollapsed !== undefined) teamPickerCollapsed = saved.teamPickerCollapsed
   if (saved.chatFilter) {
     filterState = {
       search: saved.chatFilter.search ?? "",
@@ -3397,19 +3402,44 @@ function renderTeamPicker(): void {
 
   const selectedTeamSet = new Set(userPrefs.selectedTeamIds ?? [])
   const hasSelection = selectedTeamSet.size > 0
+  const selectedNames = availableTeams
+    .filter((t) => selectedTeamSet.has(t.id))
+    .map((t) => t.displayName)
 
-  let html = `<span class="label">Teams\u00a0(channels):</span><span class="chips team-chips">`
-  for (const team of availableTeams) {
-    const active = selectedTeamSet.has(team.id)
-    html += `<button class="chip${active ? " active" : ""}" data-team-id="${escapeHtml(team.id)}" title="${escapeHtml(active ? `Deselect ${team.displayName}` : `Include channels from ${team.displayName}`)}">${escapeHtml(team.displayName)}</button>`
-  }
-  html += `</span>`
+  let html = `<span class="label">Teams\u00a0(channels):</span>`
 
-  if (!hasSelection) {
-    html += `<span class="channel-hint">Pick a team above to include its channels in the list.</span>`
+  if (teamPickerCollapsed) {
+    // nhk: collapsed to a selected-summary — team names, or "N teams" when >3 —
+    // with an Edit control to expand.
+    let summary: string
+    if (!hasSelection) summary = "None selected"
+    else if (selectedNames.length <= 3) summary = selectedNames.join(", ")
+    else summary = `${selectedNames.length} teams`
+    html += `<span class="team-summary" title="${escapeHtml(hasSelection ? selectedNames.join(", ") : "No teams selected")}">${escapeHtml(summary)}</span>`
+    html += `<button class="chip team-picker-edit" id="team-picker-toggle" aria-expanded="false" title="Edit team selection">Edit</button>`
+  } else {
+    html += `<span class="chips team-chips">`
+    for (const team of availableTeams) {
+      const active = selectedTeamSet.has(team.id)
+      html += `<button class="chip${active ? " active" : ""}" data-team-id="${escapeHtml(team.id)}" title="${escapeHtml(active ? `Deselect ${team.displayName}` : `Include channels from ${team.displayName}`)}">${escapeHtml(team.displayName)}</button>`
+    }
+    html += `</span>`
+    html += `<button class="chip team-picker-edit" id="team-picker-toggle" aria-expanded="true" title="Collapse team selection">Done</button>`
+    if (!hasSelection) {
+      html += `<span class="channel-hint">Pick a team above to include its channels in the list.</span>`
+    }
   }
 
   field.innerHTML = html
+
+  const toggleBtn = field.querySelector<HTMLButtonElement>("#team-picker-toggle")
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", () => {
+      teamPickerCollapsed = !teamPickerCollapsed
+      saveUIPrefs()
+      renderTeamPicker()
+    })
+  }
 
   field.querySelectorAll<HTMLButtonElement>(".chip[data-team-id]").forEach((btn) => {
     btn.addEventListener("click", () => {
