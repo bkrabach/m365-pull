@@ -1571,6 +1571,46 @@ function updateContainerSummary(visible: number): void {
   }
 }
 
+/** STEP 0 shared row renderer.
+ *
+ * Every list row — grouped chat/channel header, flat message/recording/channel
+ * row, grouped child row, group sub-header, channel thread/tail row — emits the
+ * SAME fixed left-column order through this one helper, so columns line up
+ * regardless of which slots a given row actually fills:
+ *
+ *   [expand-caret][checkbox][favorite][type-icon][title/sub info][right actions]
+ *
+ * A slot the row doesn't use renders an empty `.ac-slot` spacer so the grid
+ * still reserves its column (flat rows reserve an empty caret slot; recording
+ * child rows reserve an empty favorite slot). The `.ac-row` CSS grid gives the
+ * columns their fixed widths. `info` and `actions` are full HTML strings the
+ * caller builds, so existing per-row typography/controls are reused verbatim. */
+interface AcRowSlots {
+  caret?: string
+  checkbox?: string
+  favorite?: string
+  icon?: string
+  info: string
+  actions?: string
+}
+
+const AC_SLOT_EMPTY = `<span class="ac-slot" aria-hidden="true"></span>`
+
+/** Build the ordered inner cells of a `.ac-row` grid (caret→checkbox→favorite
+ * →icon→info→actions). Callers wrap this in the row element (`<li>`/`<div>`
+ * carrying `.ac-row`), or, for expandable containers, in `<div class="ac-row">`
+ * followed by the expandable `.artifact-rows` block. */
+function acRowCells(slots: AcRowSlots): string {
+  return (
+    `${slots.caret ?? AC_SLOT_EMPTY}` +
+    `${slots.checkbox ?? AC_SLOT_EMPTY}` +
+    `${slots.favorite ?? AC_SLOT_EMPTY}` +
+    `${slots.icon ?? AC_SLOT_EMPTY}` +
+    `${slots.info}` +
+    `<div class="row-actions">${slots.actions ?? ""}</div>`
+  )
+}
+
 function renderContainerRow(
   chat: TeamsChatItem,
   recContainer: RecordingContainer | undefined,
@@ -1625,20 +1665,20 @@ function renderContainerRow(
   const allSelected = selectedCount > 0 && selectedCount === artifactIds.length
   // indeterminate state (someSelected) must be set via JS after render \u2014 not expressible in HTML
 
-  return `
-    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
-      <div class="chat-row-header">
-        <button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
-        <input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">
-        <span class="fav-state${isMarked ? " favorited" : ""}" title="${isMarked ? "Favorited \u2014 expand to change which streams" : "Not favorited \u2014 expand to favorite a stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}">${isMarked ? "\u2605" : "\u2606"}</span>
-        <div class="chat-info">
+  const caret = `<button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
+  const checkbox = `<input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">`
+  const favorite = `<span class="fav-state${isMarked ? " favorited" : ""}" title="${isMarked ? "Favorited \u2014 expand to change which streams" : "Not favorited \u2014 expand to favorite a stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}">${isMarked ? "\u2605" : "\u2606"}</span>`
+  const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(sub)}</div>
-        </div>
-        ${recIndicatorHtml}
-        <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-        <button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>
-      </div>
+        </div>`
+  const actions =
+    `${recIndicatorHtml}` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `<button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
+  return `
+    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
+      <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
       <div class="artifact-rows"${isExpanded ? "" : " hidden"}>
         ${renderArtifactRows(chat, recContainer)}
       </div>
@@ -1677,17 +1717,16 @@ function messagesArtifactRowHtml(
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const ctxSuffix = flat ? ` for ${chatName}` : ""
-  return `
-    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">
-      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact${escapeHtml(ctxSuffix)}">
-      <button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>
-      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>
-      <div class="artifact-info">
+  const checkbox = `<input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact${escapeHtml(ctxSuffix)}">`
+  const favorite = `<button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>`
+  const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>`
+  const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
-      </div>
-      <button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>
-    </${tag}>
+      </div>`
+  const actions = `<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
+  return `
+    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</${tag}>
   `
 }
 
@@ -1733,17 +1772,18 @@ function recordingArtifactRowHtml(
   const subRaw = flat
     ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}${recTag}`
     : `${baseSub}${recTag}`
-  return `
-    <${tag} class="artifact-row${flatClass}" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">
-      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">
-      ${favBtn}
-      <span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>
-      <div class="artifact-info">
+  const checkbox = `<input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">`
+  const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>`
+  const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
-      </div>
-      <button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>
-    </${tag}>
+      </div>`
+  const actions = `<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
+  // kkc: grouped recording rows reserve an EMPTY favorite slot (favBtn === "")
+  // so their checkbox\u2192type-icon gap matches message rows; flat rows carry the
+  // shared recordings-stream \u2605.
+  return `
+    <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite: favBtn || undefined, icon, info, actions })}</${tag}>
   `
 }
 
@@ -1762,11 +1802,9 @@ function renderArtifactRows(
     const recFav = isRecordingsFavorited(chatId)
     // Recordings-stream favorite lives on a group header (the stream is the unit;
     // individual recordings are immutable and not separately favoritable).
+    const recFavBtn = `<button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>`
     html += `
-      <div class="artifact-group-header" data-chat-id="${escapeHtml(chatId)}">
-        <button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>
-        <span class="artifact-group-label">Recordings (${n})</span>
-      </div>
+      <div class="artifact-group-header ac-row" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ favorite: recFavBtn, info: `<span class="artifact-group-label">Recordings (${n})</span>` })}</div>
     `
     for (const rec of recContainer.recordings) {
       html += recordingArtifactRowHtml(chat, rec, "grouped")
@@ -2906,37 +2944,25 @@ function renderChannelThreadRows(
     const dateStr = thread.createdDateTime ? formatDate(thread.createdDateTime) : "\u2014"
     const replyCount = thread.replies.length
     const subText = `${thread.author} \u00b7 ${dateStr} \u00b7 ${replyCount} repl${replyCount !== 1 ? "ies" : "y"}`
-    html += `
-      <div class="artifact-row" data-thread-root-id="${escapeHtml(thread.rootId)}" data-channel-id="${escapeHtml(chanId)}">
-        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
-        <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
-        <div class="artifact-info">
+    const threadInfo = `<div class="artifact-info">
           <div class="artifact-name">${escapeHtml(thread.subject)}</div>
           <div class="artifact-sub">${escapeHtml(subText)}</div>
-        </div>
-        <button class="artifact-download channel-thread-download"
-          data-channel-id="${escapeHtml(chanId)}"
-          data-thread-root-id="${escapeHtml(thread.rootId)}"
-          title="Download this thread"
-          aria-label="Download thread: ${escapeHtml(thread.subject)}"><span aria-hidden="true">\u2b07</span></button>
-      </div>
+        </div>`
+    const threadActions = `<button class="artifact-download channel-thread-download" data-channel-id="${escapeHtml(chanId)}" data-thread-root-id="${escapeHtml(thread.rootId)}" title="Download this thread" aria-label="Download thread: ${escapeHtml(thread.subject)}"><span aria-hidden="true">\u2b07</span></button>`
+    html += `
+      <div class="artifact-row ac-row" data-thread-root-id="${escapeHtml(thread.rootId)}" data-channel-id="${escapeHtml(chanId)}">${acRowCells({ icon: `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>`, info: threadInfo, actions: threadActions })}</div>
     `
   }
 
   // Tail row when there are more than 5 threads in window.
   // NO number in the label per spec ("and more…", not "and N more").
   if (preview.total > 5 || preview.truncated) {
-    html += `
-      <div class="artifact-row channel-tail-row" data-channel-id="${escapeHtml(chanId)}">
-        <span class="artifact-check" style="visibility:hidden" aria-hidden="true"></span>
-        <div class="artifact-info">
+    const tailInfo = `<div class="artifact-info">
           <div class="artifact-sub">and more\u2026</div>
-        </div>
-        <button class="artifact-download channel-download-all"
-          data-channel-id="${escapeHtml(chanId)}"
-          title="Download all threads in window"
-          aria-label="Download all threads in window"><span aria-hidden="true">\u2b07</span> Download all</button>
-      </div>
+        </div>`
+    const tailActions = `<button class="artifact-download channel-download-all" data-channel-id="${escapeHtml(chanId)}" title="Download all threads in window" aria-label="Download all threads in window"><span aria-hidden="true">\u2b07</span> Download all</button>`
+    html += `
+      <div class="artifact-row channel-tail-row ac-row" data-channel-id="${escapeHtml(chanId)}">${acRowCells({ info: tailInfo, actions: tailActions })}</div>
     `
   }
 
@@ -2973,45 +2999,35 @@ function renderChannelRowHtml(
     // The download button (artifact-download + data-channel-id) is also wired there.
     // The checkbox (channel-select-check) is wired by wireChannelListeners too.
     const sub = buildChannelSubLine(channel, preview, activityMs)
-    return `
-    <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">
-      <input type="checkbox" class="artifact-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} aria-label="Select ${escapeHtml(name)} for bulk download">
-      <button class="fav-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel \u2014 always shown and synced on every Sync"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>
-      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>
-      <div class="artifact-info">
+    const checkbox = `<input type="checkbox" class="artifact-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} aria-label="Select ${escapeHtml(name)} for bulk download">`
+    const favorite = `<button class="fav-toggle${isFav ? " favorited" : ""}" data-stream="channel" data-channel-id="${escapeHtml(channelId)}" title="${isFav ? "Un-favorite this channel" : "Favorite this channel \u2014 always shown and synced on every Sync"}" aria-label="${isFav ? "Un-favorite channel" : "Favorite channel"}" aria-pressed="${isFav ? "true" : "false"}">${isFav ? "\u2605" : "\u2606"}</button>`
+    const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCEC</span>`
+    const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(name)}</div>
         <div class="artifact-sub">${escapeHtml(sub)}</div>
-      </div>
-      <button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>
-    </li>
+      </div>`
+    const actions = `<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
+    return `
+    <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""} ac-row" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</li>
   `
   }
 
   // Grouped view: keep the existing container chrome (matches renderContainerRow neighbours).
   const isExpanded = expandedChannelIds.has(channelId)
-  return `
-    <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
-      <div class="chat-row-header">
-        <button class="expand-toggle channel-expand-toggle"
-          data-channel-id="${escapeHtml(channelId)}"
-          aria-expanded="${isExpanded ? "true" : "false"}"
-          title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
-        <input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">
-        <span class="fav-state${isFav ? " favorited" : ""}" title="${isFav ? "Favorited \u2014 expand to change" : "Not favorited \u2014 expand to favorite"}" aria-label="${isFav ? "Favorited" : "Not favorited"}">${isFav ? "\u2605" : "\u2606"}</span>
-        <div class="chat-info">
+  const caret = `<button class="expand-toggle channel-expand-toggle" data-channel-id="${escapeHtml(channelId)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse threads" : "Expand threads"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
+  const checkbox = `<input type="checkbox" class="select-all-check channel-select-check" data-channel-id="${escapeHtml(channelId)}"${isSelected ? " checked" : ""} title="Select this channel for bulk download" aria-label="Select ${escapeHtml(name)} for bulk download">`
+  const favorite = `<span class="fav-state${isFav ? " favorited" : ""}" title="${isFav ? "Favorited \u2014 expand to change" : "Not favorited \u2014 expand to favorite"}" aria-label="${isFav ? "Favorited" : "Not favorited"}">${isFav ? "\u2605" : "\u2606"}</span>`
+  const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(buildChannelSubLine(channel, preview, activityMs))}</div>
-        </div>
-        ${renderThreadIndicator(preview)}
-        <button class="ignore-toggle${isIgnored ? " ignored" : ""}"
-          data-channel-id="${escapeHtml(channelId)}"
-          title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}"
-          aria-label="${isIgnored ? "Un-ignore" : "Ignore"}"
-          aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-        <button class="container-action"
-          data-channel-id="${escapeHtml(channelId)}"
-          aria-label="Download threads for ${escapeHtml(name)}">Download</button>
-      </div>
+        </div>`
+  const actions =
+    `${renderThreadIndicator(preview)}` +
+    `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `<button class="container-action" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}">Download</button>`
+  return `
+    <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">
+      <div class="ac-row">${acRowCells({ caret, checkbox, favorite, info, actions })}</div>
       <div class="artifact-rows channel-artifact-rows"${isExpanded ? "" : " hidden"}>
         ${renderChannelThreadRows(channel, preview)}
       </div>
