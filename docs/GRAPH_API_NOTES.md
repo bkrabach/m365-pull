@@ -225,6 +225,103 @@ Until then the honest scope is: **delegated, browser SPA, 8 attempts, 0 successe
 
 ---
 
+## 10. Recording transcripts: the `media/transcripts` SP path is now app-whitelist-gated
+
+Downloading a Teams meeting **recording transcript** regressed. The recording-file
+strategy in `src/sources/teams-recordings.ts` — resolve the share to a driveItem, then
+read `media/transcripts` from SharePoint REST v2.1 with a SharePoint-resource token —
+now returns **HTTP 403** from a live run:
+
+```
+GET https://{spHost}/_api/v2.1/drives/{driveId}/items/{itemId}
+      ?select=name,media/transcripts&$expand=media/transcripts
+Authorization: Bearer <token for https://{spHost}/.default>
+
+403 Forbidden
+{"error":{"code":"accessDenied","message":"For protected mp4 file, this API is only
+ supported for whitelisted apps, your app id 63231eb0-9b53-4342-8ac4-5209d618684e is
+ not whitelisted."}}
+```
+
+### This is the app-identity gate, NOT a missing SharePoint scope
+
+The distinction matters because the two failures look similar but have opposite fixes,
+and only one of them is fixable in this codebase.
+
+- **The token was accepted.** The request reached the SharePoint media service and came
+  back with a *semantic* rejection that names our concrete Entra app id. A missing
+  SharePoint API permission fails **earlier and differently**: `getSpToken()`'s
+  `acquireTokenSilent({ scopes: ["https://{spHost}/.default"] })` throws (nothing
+  consented for that resource) and falls back to redirect — or the API answers with a
+  generic `401` / permission-ACL `403`. It does not answer with "your app id … is not
+  whitelisted."
+- **`accessDenied` here is authorization, downstream of authentication**, keyed to an
+  app-identity **allow-list Microsoft maintains** for *protected* mp4 media. "Protected"
+  = the recording's mp4 is rights-protected/encrypted; its `media/transcripts` expansion
+  and the `streamContent` download pipeline are restricted to Microsoft first-party app
+  identities (Stream / Teams / the SharePoint & OneDrive web clients).
+- **No consentable permission changes app identity.** There is no scope you can add to
+  the app registration to get onto that list. Adding `AllSites.Read` / `Sites.Read.All`
+  (the perms this file's header calls for) gets you a *valid token* — which is exactly
+  what we already have, and exactly what gets refused.
+
+Why the reference Chrome extension (`bkrabach/teams-transcript-md`) still works and we
+don't: it runs in the **first-party web origin** on the user's session cookies (the
+Stream/SharePoint web app's *own* whitelisted identity). We call cross-origin with a
+**third-party Entra app** bearer token. The code already knew this in spirit —
+`teams-recordings.ts:257` notes "The Chrome extension can get away with cookies; we
+cannot." The whitelist gate is the sharp edge of that same difference.
+
+### No delegated Graph transcript path exists for the general case
+
+Confirmed by reasoning over already-measured facts (this box has no Graph/SharePoint
+token or network — analysis is code + prior probes, **not** a live re-run):
+
+| Candidate delegated path | Verdict |
+|---|---|
+| `GET /me/onlineMeetings/{id}/transcripts` (+ `getAllTranscripts`) | Organizer-only. Returns only meetings the signed-in user **organized**. The scraper's job is non-organizer meetings. (Stated in `teams-recordings.ts:7-9`.) |
+| `GET /users/{organizerId}/onlineMeetings/getAllTranscripts` | Requires `meetingOrganizerUserId`; the delegated call requires you to **be** that user. A prior probe returned **400** without the organizer id. Not usable for arbitrary participants. |
+| App-only `OnlineMeetingTranscript.Read.All` / `OnlineMeetingRecording.Read.All` (the app holds these) | Needs an **app-only token** (client secret) **and** a Teams application access policy (`New-CsApplicationAccessPolicy`, admin PowerShell). A no-backend browser SPA **cannot hold a secret** (see §6 for the same no-backend wall). And it would not bypass this SharePoint protected-mp4 gate anyway — that's a separate control. |
+| SharePoint `media/transcripts` + `streamContent` rewrite (this file's strategy) | **Is** the gated surface. Both the `$expand` and the `.../streamContent?is=1&applymediaedits=false` download hit the protected-media pipeline. |
+
+### Verdict: BLOCKED-external
+
+There is **no in-code alt-path** that restores non-organizer recording-transcript
+download from this no-backend SPA + third-party app model. The only resolutions are
+Microsoft-side:
+
+1. **Whitelist the app.** Get app id `63231eb0-9b53-4342-8ac4-5209d618684e` added to
+   Microsoft's allow-list for the protected-mp4 media API. This is a Microsoft-controlled
+   list, not a self-service consent — there is no known public request flow for a
+   third-party app. The exact gated endpoint to cite in any request:
+   `GET https://{spHost}/_api/v2.1/drives/{driveId}/items/{itemId}?$expand=media/transcripts`.
+2. **Run in a first-party origin/cookie context** — i.e. a browser extension at the
+   Stream/SharePoint web origin (the reference-extension architecture), which uses the
+   session's own whitelisted identity. That is an **architecture change**, not an edit to
+   this SPA.
+
+### Recommended in-code follow-up (graceful degradation — NOT a fix)
+
+This does not recover the transcript; it stops one expected-permanent 403 from looking
+like a scary generic failure, matching the house pattern for §7 `AclCheckFailed` and
+`CrossTenantRecordingError`. It spans two files (the second is outside this lane's
+ownership, so it is recorded, not applied here):
+
+- `teams-recordings.ts` — in `fetchRecordingTranscripts`, when the metadata response is
+  403 and the body matches `not whitelisted` / `protected mp4`, throw a typed
+  `ProtectedRecordingError` (discriminant `protectedRecording = true`, mirroring
+  `CrossTenantRecordingError`) instead of the generic `Error(...)`.
+- `main.ts` `downloadRecordingTranscript` catch (~:3778) — add an
+  `else if ((err as {protectedRecording?: boolean}).protectedRecording)` branch that
+  sets a calm status ("protected recording — Microsoft only allows first-party apps to
+  download it") and returns a new typed outcome counted separately from `fail`, the way
+  `cross-tenant` already is (~:3819, :3825).
+
+Until then, the whitelist 403 lands in the generic `fail` bucket: it shows
+`Error: SharePoint metadata: 403 … not whitelisted` and logs a `console.error`.
+
+---
+
 ## The pattern worth internalizing
 
 Every bug above failed **silently**. Nothing threw. Nothing logged. The app returned a
