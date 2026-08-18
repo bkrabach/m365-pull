@@ -1611,6 +1611,18 @@ function acRowCells(slots: AcRowSlots): string {
   )
 }
 
+/** nxq: the download-status label that lives in the right action cluster (just
+ * left of the download button), for every row type. `lastSync` is the row's
+ * own last-download timestamp (ms) or undefined. Always renders — including an
+ * explicit "Not downloaded yet" (previously missing on single recordings). */
+function downloadedLabelHtml(lastSync: string | number | undefined): string {
+  const downloaded = lastSync !== undefined
+  const text = downloaded
+    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
+    : "Not downloaded yet"
+  return `<span class="dl-label${downloaded ? " downloaded" : " not-downloaded"}">${escapeHtml(text)}</span>`
+}
+
 function renderContainerRow(
   chat: TeamsChatItem,
   recContainer: RecordingContainer | undefined,
@@ -1619,11 +1631,9 @@ function renderContainerRow(
   const isMarked = isChatFavorited(chat.id)
   const isIgnored = ignoredIds.has(chat.id)
   const lastSync = chatPrefs[chat.id]?.lastSync
-  // Item 5: capitalise "Downloaded"; make no-download state explicit.
-  const downloadedTag = lastSync
-    ? ` \u00b7 Downloaded ${formatDateShort(new Date(lastSync))}`
-    : " \u00b7 Not downloaded yet"
-  const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below).
+  const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}`
 
   // Phase 1 recording indicator: only show badge when recordings are confirmed.
   // All other states (pending, none, unknown) = silence ("no-recording = silence" design).
@@ -1681,6 +1691,7 @@ function renderContainerRow(
   const actions =
     `${recIndicatorHtml}` +
     `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `${downloadedLabelHtml(lastSync)}` +
     `<button class="container-action artifact-download"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>`
   return `
     <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
@@ -1712,14 +1723,11 @@ function messagesArtifactRowHtml(
   const msgSelected = selectedArtifacts.has(msgArtId)
   const msgFav = isMessagesFavorited(chatId)
   const lastSync = chatPrefs[chatId]?.lastSync
-  const dlTag = lastSync
-    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
-    : "Not downloaded yet"
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below).
   const lastActivity = formatDate(new Date(chatActivityDate(chat)).toISOString())
   const nameRaw = flat ? chatName : "Messages"
-  const subRaw = flat
-    ? `Messages \u00b7 ${lastActivity} \u00b7 ${dlTag}`
-    : `${lastActivity} \u00b7 ${dlTag}`
+  const subRaw = flat ? `Messages \u00b7 ${lastActivity}` : `${lastActivity}`
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const ctxSuffix = flat ? ` for ${chatName}` : ""
@@ -1730,7 +1738,7 @@ function messagesArtifactRowHtml(
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
       </div>`
-  const actions = `<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
+  const actions = `${downloadedLabelHtml(lastSync)}<button class="artifact-download" data-art-kind="messages" data-chat-id="${escapeHtml(chatId)}" data-chat-name="${escapeHtml(chatName)}" title="Download messages now" aria-label="Download messages${escapeHtml(ctxSuffix)}"><span aria-hidden="true">\u2b07</span></button>`
   return `
     <${tag} class="artifact-row${flatClass} ac-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</${tag}>
   `
@@ -1764,9 +1772,9 @@ function recordingArtifactRowHtml(
     .filter(Boolean)
     .join(", ")
   const recLastSync = recordingPrefs[rec.id]?.lastSync
-  const recTag = recLastSync
-    ? ` \u00b7 Downloaded ${formatDateShort(new Date(recLastSync))}`
-    : ""
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (see `actions` below) \u2014 this also adds the previously
+  // missing "Not downloaded yet" state for single recordings.
   const baseSub = [duration, attendees].filter(Boolean).join(" \u00b7 ")
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
@@ -1776,15 +1784,15 @@ function recordingArtifactRowHtml(
     : ""
   const nameRaw = flat ? chatName : `Recording \u2014 ${dateLabel}`
   const subRaw = flat
-    ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}${recTag}`
-    : `${baseSub}${recTag}`
+    ? `Recording ${dateLabel}${baseSub ? " \u00b7 " + baseSub : ""}`
+    : `${baseSub}`
   const checkbox = `<input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact${flat ? escapeHtml(` for ${chatName}`) : ""}">`
   const icon = `<span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>`
   const info = `<div class="artifact-info">
         <div class="artifact-name">${escapeHtml(nameRaw)}</div>
         <div class="artifact-sub">${escapeHtml(subRaw)}</div>
       </div>`
-  const actions = `<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
+  const actions = `${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
   // kkc: grouped recording rows reserve an EMPTY favorite slot (favBtn === "")
   // so their checkbox\u2192type-icon gap matches message rows; flat rows carry the
   // shared recordings-stream \u2605.
@@ -2879,10 +2887,8 @@ function buildChannelSubLine(
   preview: ChannelPreviewEntry | undefined,
   activityMs: number | null | undefined,
 ): string {
-  const lastSync = chatPrefs[channel.id]?.lastSync
-  const dlStatus = lastSync
-    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
-    : "Not downloaded yet"
+  // nxq: download status moved out of the sub-line into a label in the right
+  // action cluster (rendered by renderChannelRowHtml, both view modes).
   if (preview?.status === "error") {
     return `Channel \u00b7 ${channel.teamName} \u00b7 ${preview.errorMessage ?? "Error"}`
   }
@@ -2894,7 +2900,7 @@ function buildChannelSubLine(
   } else {
     activityLabel = `last activity ${formatDate(new Date(activityMs).toISOString())}`
   }
-  return `Channel \u00b7 ${channel.teamName} \u00b7 ${activityLabel} \u00b7 ${dlStatus}`
+  return `Channel \u00b7 ${channel.teamName} \u00b7 ${activityLabel}`
 }
 
 /** HTML for the expanded body of a channel row: group header + up to 5 preview
@@ -3012,7 +3018,7 @@ function renderChannelRowHtml(
         <div class="artifact-name">${escapeHtml(name)}</div>
         <div class="artifact-sub">${escapeHtml(sub)}</div>
       </div>`
-    const actions = `<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
+    const actions = `${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}<button class="artifact-download" data-channel-id="${escapeHtml(channelId)}" title="Download threads for ${escapeHtml(name)}" aria-label="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
     return `
     <li class="artifact-row artifact-flat channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""} ac-row" data-artifact-id="${escapeHtml(chanArtId)}" data-channel-id="${escapeHtml(channelId)}">${acRowCells({ checkbox, favorite, icon, info, actions })}</li>
   `
@@ -3034,6 +3040,7 @@ function renderChannelRowHtml(
   const actions =
     `${renderThreadIndicator(preview)}` +
     `<button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-channel-id="${escapeHtml(channelId)}" title="${isIgnored ? "Un-ignore this channel" : "Ignore this channel"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>` +
+    `${downloadedLabelHtml(chatPrefs[channelId]?.lastSync)}` +
     `<button class="container-action artifact-download" data-channel-id="${escapeHtml(channelId)}" aria-label="Download threads for ${escapeHtml(name)}" title="Download threads for ${escapeHtml(name)}"><span aria-hidden="true">\u2b07</span></button>`
   return `
     <li class="chat-row channel-row${isIgnored ? " ignored" : ""}${isFav ? " marked" : ""}${isExpanded ? " expanded" : ""}" data-channel-id="${escapeHtml(channelId)}">

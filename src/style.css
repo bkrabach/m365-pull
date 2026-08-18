@@ -1089,6 +1089,18 @@ header {
   margin-left: 0;
 }
 
+/* nxq: download-status label in the right action cluster (just left of the
+ * download button), replacing the old inline "· Downloaded {date}" sub-line. */
+.dl-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.dl-label.not-downloaded {
+  font-style: italic;
+  opacity: 0.75;
+}
+
 /* "Show ignored" chip in the filter bar */
 .chip.show-ignored.active {
   background: #6b7280;
