@@ -60,12 +60,22 @@ async function saveTextFile(
     ? cleaned
     : cleaned + opts.extension
 
+  // Honest feature detection. A browser without the anchor `download`
+  // attribute (Safari before 10.1) does NOT save the blob -- it navigates to
+  // it / opens it inline instead. That path never throws, so a blind
+  // `saved: true` would report a silent failure as success. Detect it up front
+  // and report it as unsupported.
+  const anchor = document.createElement("a")
+  if (!("download" in anchor)) {
+    return { saved: false, reason: "unsupported" }
+  }
+
   let url: string | undefined
   try {
     const blob = new Blob([content], { type: `${opts.mimeType};charset=utf-8` })
     url = URL.createObjectURL(blob)
+    const objectUrl = url
 
-    const anchor = document.createElement("a")
     anchor.href = url
     anchor.download = safeName
     anchor.rel = "noopener"
@@ -73,16 +83,28 @@ async function saveTextFile(
     // Must be in the document for the click to dispatch in Firefox.
     document.body.appendChild(anchor)
     anchor.click()
-    anchor.remove()
 
-    // Revoking synchronously can cancel an in-flight download; give the browser
-    // time to consume the blob first.
-    const objectUrl = url
+    // Safari/WebKit aborts the download if the anchor is torn down in the same
+    // frame as the click: it needs the element to survive at least one tick to
+    // consume it. Removing it synchronously (the previous behaviour) was the
+    // root cause of downloads silently failing on Safari/Mac. Chrome and
+    // Firefox tolerate synchronous teardown, so deferring is safe for all
+    // three. The click has already dispatched synchronously above, so Firefox's
+    // "anchor must be in the document" requirement is still satisfied.
+    setTimeout(() => anchor.remove(), 0)
+    // Revoking synchronously can likewise cancel an in-flight download; give
+    // the browser time to consume the blob first.
     setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000)
 
+    // NOTE: this reports that the download was successfully *initiated* on a
+    // browser that supports the mechanism -- it is not a confirmation the file
+    // was written. The anchor+blob technique exposes no acceptance signal, so
+    // that is the strongest honest claim available. Undetectable failures
+    // (user declines the browser's save prompt, disk full) cannot surface here.
     return { saved: true }
   } catch (err) {
     if (url) URL.revokeObjectURL(url)
+    anchor.remove()
     return { saved: false, reason: (err as Error).message }
   }
 }

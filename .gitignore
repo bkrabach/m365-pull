@@ -8,3 +8,6 @@ dist/
 .env
 .env.local
 .env.*.local
+
+# Goal-batch lane marker -- throwaway, never commit.
+DONE.json
