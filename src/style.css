@@ -1122,46 +1122,89 @@ header {
   font-weight: 600;
 }
 
-/* Protected-recording hand-off affordance (recordingArtifactRowHtml). Sits in
- * the same right-side .row-actions cluster as the download button it
- * replaces, but is allowed to wrap/grow since its content (note text + two
- * links + a checkbox) doesn't fit a single button-sized slot. */
-.protected-note {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.3rem;
-  max-width: 280px;
-  padding: 0.5rem 0.6rem;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 6px;
-  text-align: left;
+/* Protected-recording hand-off affordances (recordingArtifactRowHtml). The row
+ * carries the "Protected" label, an \u2197 OPEN-icon link (opens that recording's
+ * page) and a small \u24d8 INFO trigger for the ONE shared, generic popover (native
+ * Popover API). The popover holds NO per-recording link \u2014 those live on the row
+ * and in the bulk status list. */
+.protected-info-btn {
+  flex-shrink: 0;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
 }
-.protected-note-text {
-  margin: 0;
-  font-size: 0.75rem;
-  line-height: 1.35;
+.protected-info-btn:hover {
+  color: var(--accent-hover);
+  background: var(--row-hover);
+}
+
+/* The popover itself is promoted to the top layer when open, so it escapes the
+ * row's grid/overflow. Centered card (UA default inset:0;margin:auto) with a
+ * dim ::backdrop; light-dismiss + Esc come free from popover="auto". */
+.protected-popover {
+  position: fixed;
+  margin: auto;
+  max-width: 320px;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
   color: var(--fg);
-  white-space: normal;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
 }
-.protected-note-links {
+.protected-popover::backdrop {
+  background: rgba(0, 0, 0, 0.28);
+}
+.protected-popover-close {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.4rem;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.protected-popover-close:hover {
+  color: var(--fg);
+  background: var(--row-hover);
+}
+.protected-popover-text {
+  margin: 0 1.5rem 0.6rem 0;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: var(--fg);
+}
+.protected-popover-links {
   display: flex;
-  gap: 0.75rem;
-  font-size: 0.78rem;
+  gap: 1rem;
+  margin-bottom: 0.7rem;
+  font-size: 0.82rem;
 }
-.protected-note-dismiss {
+.protected-popover-dismiss {
   display: flex;
   align-items: center;
-  gap: 0.35rem;
-  font-size: 0.72rem;
+  gap: 0.4rem;
+  font-size: 0.75rem;
   color: var(--muted);
   cursor: pointer;
 }
 .protected-open-link {
   display: inline-flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.25rem;
   font-size: 0.78rem;
   color: var(--accent);
   text-decoration: none;
@@ -1170,6 +1213,47 @@ header {
 .protected-open-link:hover {
   color: var(--accent-hover);
   text-decoration: underline;
+}
+
+/* Bulk-download protected list, rendered into #status by reportBulkDownloadResult:
+ * the summary line, then a header + one row per protected recording, each with
+ * its own \u2197 OPEN-icon link (the per-item links live HERE, not in the popover). */
+.protected-status-summary {
+  margin-bottom: 0.4rem;
+}
+.protected-status-list {
+  padding: 0.5rem 0.7rem;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+}
+.protected-status-header {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #b45309;
+  margin-bottom: 0.35rem;
+}
+.protected-status-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.protected-status-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+}
+.protected-status-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
 }
 
 /* 4qr: hidden-items management panel (shown at the top of the list when
