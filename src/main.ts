@@ -20,6 +20,7 @@ import {
 import {
   resolveRecordingFromUrl,
   fetchRecordingTranscripts,
+  ProtectedRecordingError,
 } from "./sources/teams-recordings"
 import { vttToMarkdown } from "./format/transcript-markdown"
 import { renderChatMarkdown } from "./format/chat-markdown"
@@ -231,6 +232,26 @@ let lastSyncError: string | null = null
 const selectedArtifacts: Set<string> = new Set()
 /** Ephemeral expand state — NOT persisted across page reloads. */
 const expandedChatIds: Set<string> = new Set()
+
+/** Recording ids whose transcript fetch hit the SharePoint "protected mp4"
+ * whitelist gate (ProtectedRecordingError). Ephemeral — NOT persisted; a
+ * fresh load re-discovers this the same way, on the next download attempt.
+ * recordingArtifactRowHtml uses this to hand the user off to the browser
+ * extension instead of showing a normal download button. */
+const protectedRecordingIds: Set<string> = new Set()
+/** Chrome Web Store listing for the first-party-origin capture tool. Protected
+ * recordings can't be pulled by this app (see ProtectedRecordingError); this
+ * is the tool that can, run at the SharePoint/Stream origin itself. */
+const PROTECTED_CAPTURE_EXTENSION_URL =
+  "https://chromewebstore.google.com/detail/teams-transcript-to-markd/mkkfjnjhhfnhbfcmaljelamolajalaci"
+/** localStorage flag ("1" = dismissed) for the one-time protected-recording
+ * capture note. Not user-scoped (unlike keyFor(userKey) elsewhere) — it's a
+ * device-local UI preference, not account data. */
+const PROTECTED_NOTE_DISMISSED_KEY = "m365pull.hideProtectedCaptureNote"
+
+function isProtectedCaptureNoteDismissed(): boolean {
+  return localStorage.getItem(PROTECTED_NOTE_DISMISSED_KEY) === "1"
+}
 
 // ----- Progressive-disclosure toolbar state (3-section toolbar, 2026-06-18) -----
 
@@ -1653,6 +1674,23 @@ function rerenderContainerList(): void {
         updateSelectedButton()
       })
     })
+
+    // Protected-recording capture note: "Don't show this again" dismiss
+    // checkbox. Same event-delegation pattern as the checkboxes above (query
+    // + forEach + addEventListener("change", ...) in rerenderContainerList).
+    // The flag is device-local and global (not per-recording), so checking
+    // ANY protected row's box hides the note on every protected row once
+    // rerenderContainerList() re-reads it.
+    list.querySelectorAll<HTMLInputElement>(".protected-dismiss-check").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        if (cb.checked) {
+          localStorage.setItem(PROTECTED_NOTE_DISMISSED_KEY, "1")
+        } else {
+          localStorage.removeItem(PROTECTED_NOTE_DISMISSED_KEY)
+        }
+        rerenderContainerList()
+      })
+    })
   }
   updateTypeCountChips()
   updateIgnoredControlsVisibility()
@@ -1747,6 +1785,40 @@ function hideToggleHtml(kind: "chat" | "channel", id: string, isHidden: boolean)
   const dataAttr = kind === "chat" ? `data-chat-id="${escapeHtml(id)}"` : `data-channel-id="${escapeHtml(id)}"`
   const noun = kind === "chat" ? "chat" : "channel"
   return `<button class="ignore-toggle${isHidden ? " ignored" : ""}" ${dataAttr} title="${isHidden ? `Unhide this ${noun}` : `Hide this ${noun}`}" aria-label="${isHidden ? "Unhide" : "Hide"}" aria-pressed="${isHidden ? "true" : "false"}">${isHidden ? "\u2299" : "\u2298"}</button>`
+}
+
+/** Protected-recording hand-off note (first time, not yet dismissed). Explains
+ * why m365-pull can't pull this transcript itself and links out to the
+ * teams-transcript-md browser extension (which runs at the SharePoint/Stream
+ * origin and isn't gated the way this SPA is) plus the recording's own
+ * SharePoint page. The dismiss checkbox is a device-local preference (see
+ * PROTECTED_NOTE_DISMISSED_KEY) wired in rerenderContainerList, mirroring the
+ * existing checkbox delegation pattern used by .artifact-check etc. */
+function protectedCaptureNoteHtml(rec: RecordingItem): string {
+  const recUrl = escapeHtml(rec.url)
+  return `
+    <div class="protected-note">
+      <p class="protected-note-text">Protected by Microsoft's app allow-list \u2014 m365-pull can't pull its transcript directly. Capture it with the <strong>teams-transcript-md</strong> extension and save it wherever you like. (Capturing protected recordings is out of scope for this app.)</p>
+      <div class="protected-note-links">
+        <a href="${escapeHtml(PROTECTED_CAPTURE_EXTENSION_URL)}" target="_blank" rel="noopener">Get the extension \u2197</a>
+        <a href="${recUrl}" target="_blank" rel="noopener">Open recording \u2197</a>
+      </div>
+      <label class="protected-note-dismiss">
+        <input type="checkbox" class="protected-dismiss-check">
+        Don\u2019t show this again
+      </label>
+    </div>
+  `
+}
+
+/** Protected-recording action once the capture note has been dismissed: the
+ * row's action collapses to a single link straight to the recording's
+ * SharePoint page (where the extension is run) plus a small \u24d8 that still
+ * carries the "why" as a tooltip \u2014 for anyone who forgot. Plain <a
+ * target="_blank">, so no click wiring is needed (native browser behavior). */
+function protectedOpenLinkHtml(rec: RecordingItem): string {
+  const recUrl = escapeHtml(rec.url)
+  return `<a class="protected-open-link" href="${recUrl}" target="_blank" rel="noopener" title="Protected \u2014 capture with the teams-transcript-md extension, then open here" aria-label="Open protected recording \u2014 capture with the browser extension"><span aria-hidden="true">\u24d8</span> Protected \u2014 capture with extension \u2197</a>`
 }
 
 /** 4qr: the hidden-items management view. When "Show hidden" (showIgnored) is
@@ -2028,7 +2100,15 @@ function recordingArtifactRowHtml(
       </div>`
   // 4qr: flat/single recording rows carry a hide toggle (hides the owning chat).
   const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
-  const actions = `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
+  // Protected recording (SharePoint whitelist-gated mp4): hand off to the
+  // browser extension instead of the normal download button. The label is
+  // the row's terminal state; the note/link is the actual affordance.
+  const isProtected = protectedRecordingIds.has(rec.id)
+  const actions = isProtected
+    ? `${hideBtn}<span class="dl-label protected">Protected \u2014 capture with extension</span>${
+        isProtectedCaptureNoteDismissed() ? protectedOpenLinkHtml(rec) : protectedCaptureNoteHtml(rec)
+      }`
+    : `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
   // kkc + 84b: every recording row (grouped and flat) fills the favorite column
   // with the shared recordings-stream \u2605, so the checkbox\u2192type-icon gap matches
   // message/chat rows and the column still aligns.
@@ -3973,10 +4053,13 @@ async function downloadChat(
 
 // ----- Downloading recording transcripts -----
 
-/** Outcome of a single transcript download. "cross-tenant" is NOT a failure \u2014
- * the recording lives in another org's SharePoint and isn't accessible via this
- * account; callers count it separately from real failures. */
-type TranscriptOutcome = "ok" | "fail" | "cross-tenant"
+/** Outcome of a single transcript download. "cross-tenant" and "protected" are
+ * NOT failures — "cross-tenant" means the recording lives in another org's
+ * SharePoint and isn't accessible via this account; "protected" means the
+ * recording's mp4 is rights-protected and SharePoint's media/transcripts
+ * expansion is gated to first-party apps (see ProtectedRecordingError).
+ * Callers count both separately from real failures. */
+type TranscriptOutcome = "ok" | "fail" | "cross-tenant" | "protected"
 
 async function downloadRecordingTranscript(
   recordingId: string,
@@ -4097,6 +4180,20 @@ async function downloadRecordingTranscript(
       return "fail"
     }
   } catch (err) {
+    // Protected recording: not a real failure \u2014 Microsoft gates this
+    // recording's transcript to first-party apps (Stream/Teams/SharePoint web
+    // clients); there's no consentable permission that gets a third-party app
+    // onto that allow-list. Flag the row (recordingArtifactRowHtml hands the
+    // user off to the browser extension) instead of dumping a scary generic
+    // error to the global status bar.
+    if (err instanceof ProtectedRecordingError) {
+      protectedRecordingIds.add(recording.id)
+      setStatus(
+        `\u2298 "${subject}" is protected \u2014 Microsoft only allows first-party apps to read its transcript. Use the browser extension instead.`,
+      )
+      rerenderContainerList()
+      return "protected"
+    }
     // Cross-tenant recording: not a real failure \u2014 the .mp4 lives in another
     // org's SharePoint and isn't reachable via this account.
     if ((err as { crossTenant?: boolean }).crossTenant) {
@@ -4134,6 +4231,7 @@ async function downloadContainerTranscripts(
   let ok = 0
   let fail = 0
   let crossTenant = 0
+  let protectedCount = 0
   for (let i = 0; i < container.recordings.length; i++) {
     const rec = container.recordings[i]
     button.textContent = `Downloading ${i + 1}/${container.recordings.length}\u2026`
@@ -4141,12 +4239,16 @@ async function downloadContainerTranscripts(
     const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
     if (outcome === "ok") ok++
     else if (outcome === "cross-tenant") crossTenant++
+    // Protected recordings flag their own row (via protectedRecordingIds) and
+    // aren't a failure — don't abort the batch, just skip past this one and
+    // keep counting them separately from real failures.
+    else if (outcome === "protected") protectedCount++
     else fail++
   }
   button.disabled = false
   button.textContent = originalLabel || "Download"
   setStatus(
-    `Download complete \u2014 saved ${ok} transcript${ok !== 1 ? "s" : ""}${crossTenant > 0 ? `, ${crossTenant} from another organization (unavailable)` : ""}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
+    `Download complete \u2014 saved ${ok} transcript${ok !== 1 ? "s" : ""}${crossTenant > 0 ? `, ${crossTenant} from another organization (unavailable)` : ""}${protectedCount > 0 ? `, ${protectedCount} protected (use the browser extension)` : ""}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
   )
 }
 
