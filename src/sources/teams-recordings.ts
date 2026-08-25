@@ -1,6 +1,13 @@
 import type { PublicClientApplication } from "@azure/msal-browser"
 
 import { isAllowedSharePointHost } from "./sharepoint-hosts"
+import { ProtectedRecordingError, isProtectedRecordingResponse } from "./protected-recording-error"
+
+// Re-exported so callers (main.ts) can import it from here, alongside
+// CrossTenantRecordingError -- see protected-recording-error.ts for the
+// class itself and its classification predicate (kept dependency-free there
+// so it's unit-testable in isolation).
+export { ProtectedRecordingError }
 
 // Teams meeting recording transcripts via SharePoint REST API v2.1.
 //
@@ -203,6 +210,14 @@ export async function fetchRecordingTranscripts(
   })
   if (!metaResp.ok) {
     const body = await metaResp.text()
+    // Protected recording: the mp4 is rights-protected and SharePoint's
+    // media/transcripts expansion is gated to Microsoft first-party app
+    // identities. Not a real failure -- surface as a typed, non-generic
+    // outcome so callers can hand the user off to the browser extension
+    // instead of retrying. See docs/GRAPH_API_NOTES.md §10.
+    if (isProtectedRecordingResponse(metaResp.status, body)) {
+      throw new ProtectedRecordingError()
+    }
     throw new Error(
       `SharePoint metadata: ${metaResp.status} ${metaResp.statusText} — ${body.slice(0, 300)}`,
     )

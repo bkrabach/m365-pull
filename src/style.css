@@ -1117,6 +1117,60 @@ header {
   font-style: italic;
   opacity: 0.75;
 }
+.dl-label.protected {
+  color: #b45309;
+  font-weight: 600;
+}
+
+/* Protected-recording hand-off affordance (recordingArtifactRowHtml). Sits in
+ * the same right-side .row-actions cluster as the download button it
+ * replaces, but is allowed to wrap/grow since its content (note text + two
+ * links + a checkbox) doesn't fit a single button-sized slot. */
+.protected-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  max-width: 280px;
+  padding: 0.5rem 0.6rem;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  text-align: left;
+}
+.protected-note-text {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  color: var(--fg);
+  white-space: normal;
+}
+.protected-note-links {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.78rem;
+}
+.protected-note-dismiss {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.protected-open-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.protected-open-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
 
 /* 4qr: hidden-items management panel (shown at the top of the list when
  * "Show hidden" is on). Lists every hidden chat/channel with a per-item Unhide. */
