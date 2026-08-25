@@ -244,12 +244,21 @@ const protectedRecordingIds: Set<string> = new Set()
  * is the tool that can, run at the SharePoint/Stream origin itself. */
 const PROTECTED_CAPTURE_EXTENSION_URL =
   "https://chromewebstore.google.com/detail/teams-transcript-to-markd/mkkfjnjhhfnhbfcmaljelamolajalaci"
-/** localStorage flag ("1" = dismissed) for the one-time protected-recording
- * capture note. Not user-scoped (unlike keyFor(userKey) elsewhere) — it's a
- * device-local UI preference, not account data. */
+/** localStorage flag ("1" = set) that suppresses the AUTOMATIC protected-capture
+ * popover only. When set: the popover no longer auto-opens on a single or bulk
+ * protected failure — but the per-row ⓘ still opens it on demand, and the
+ * per-row / bulk-status OPEN-icon links still work. Not user-scoped (unlike
+ * keyFor(userKey) elsewhere) — it's a device-local UI preference. */
 const PROTECTED_NOTE_DISMISSED_KEY = "m365pull.hideProtectedCaptureNote"
+/** Fixed id of the ONE shared, generic protected-capture popover (created once,
+ * lives in <body>, reused by every protected row's ⓘ trigger via the native
+ * Popover API and by the auto-open on protected failures). */
+const PROTECTED_POPOVER_ID = "protected-capture-popover"
 
-function isProtectedCaptureNoteDismissed(): boolean {
+/** True when the user has opted out of the AUTOMATIC popover (see
+ * PROTECTED_NOTE_DISMISSED_KEY). Only gates auto-open — never the on-demand ⓘ
+ * or the OPEN-icon links. */
+function isProtectedAutoPopupSuppressed(): boolean {
   return localStorage.getItem(PROTECTED_NOTE_DISMISSED_KEY) === "1"
 }
 
@@ -1675,22 +1684,12 @@ function rerenderContainerList(): void {
       })
     })
 
-    // Protected-recording capture note: "Don't show this again" dismiss
-    // checkbox. Same event-delegation pattern as the checkboxes above (query
-    // + forEach + addEventListener("change", ...) in rerenderContainerList).
-    // The flag is device-local and global (not per-recording), so checking
-    // ANY protected row's box hides the note on every protected row once
-    // rerenderContainerList() re-reads it.
-    list.querySelectorAll<HTMLInputElement>(".protected-dismiss-check").forEach((cb) => {
-      cb.addEventListener("change", () => {
-        if (cb.checked) {
-          localStorage.setItem(PROTECTED_NOTE_DISMISSED_KEY, "1")
-        } else {
-          localStorage.removeItem(PROTECTED_NOTE_DISMISSED_KEY)
-        }
-        rerenderContainerList()
-      })
-    })
+    // Protected-recording rows carry a \u24d8 trigger that targets the ONE shared
+    // popover by id (native Popover API — no per-row wiring). Ensure that
+    // shared element exists in <body> whenever any protected row is on screen,
+    // so those triggers have a live target. Its dismiss checkbox is wired once,
+    // at creation (see ensureSharedProtectedPopover) — not here.
+    if (protectedRecordingIds.size > 0) ensureSharedProtectedPopover()
   }
   updateTypeCountChips()
   updateIgnoredControlsVisibility()
@@ -1787,38 +1786,95 @@ function hideToggleHtml(kind: "chat" | "channel", id: string, isHidden: boolean)
   return `<button class="ignore-toggle${isHidden ? " ignored" : ""}" ${dataAttr} title="${isHidden ? `Unhide this ${noun}` : `Hide this ${noun}`}" aria-label="${isHidden ? "Unhide" : "Hide"}" aria-pressed="${isHidden ? "true" : "false"}">${isHidden ? "\u2299" : "\u2298"}</button>`
 }
 
-/** Protected-recording hand-off note (first time, not yet dismissed). Explains
- * why m365-pull can't pull this transcript itself and links out to the
- * teams-transcript-md browser extension (which runs at the SharePoint/Stream
- * origin and isn't gated the way this SPA is) plus the recording's own
- * SharePoint page. The dismiss checkbox is a device-local preference (see
- * PROTECTED_NOTE_DISMISSED_KEY) wired in rerenderContainerList, mirroring the
- * existing checkbox delegation pattern used by .artifact-check etc. */
-function protectedCaptureNoteHtml(rec: RecordingItem): string {
-  const recUrl = escapeHtml(rec.url)
-  return `
-    <div class="protected-note">
-      <p class="protected-note-text">Protected by Microsoft's app allow-list \u2014 m365-pull can't pull its transcript directly. Capture it with the <strong>teams-transcript-md</strong> extension and save it wherever you like. (Capturing protected recordings is out of scope for this app.)</p>
-      <div class="protected-note-links">
-        <a href="${escapeHtml(PROTECTED_CAPTURE_EXTENSION_URL)}" target="_blank" rel="noopener">Get the extension \u2197</a>
-        <a href="${recUrl}" target="_blank" rel="noopener">Open recording \u2197</a>
-      </div>
-      <label class="protected-note-dismiss">
-        <input type="checkbox" class="protected-dismiss-check">
-        Don\u2019t show this again
-      </label>
-    </div>
-  `
+// ----- Protected-recording hand-off affordances (unified model) -----
+//
+// Icon rule (applied everywhere): a click that OPENS A PAGE uses the OPEN icon
+// (\u2197, the same glyph the OneDrive-folder "Open" link already uses); a click
+// that SHOWS INFO uses the INFO icon (\u24d8). So:
+//   \u2197 open-link  \u2192 opens the recording's own SharePoint page (new tab)
+//   \u24d8 info button \u2192 opens the ONE shared, generic capture popover (info only)
+// The generic popover is created once (ensureSharedProtectedPopover), lives in
+// <body>, and is reused by every protected row's \u24d8 and by the auto-open on
+// protected failures. It holds NO per-recording "Open recording" link \u2014 those
+// live on each row and in the bulk status list.
+
+/** The \u24d8 info trigger. Generic \u2014 always targets the ONE shared popover by id
+ * via the native Popover API (no JS wiring needed for open). Shows info only;
+ * never opens a page. */
+function protectedInfoBtnHtml(): string {
+  return `<button type="button" class="protected-info-btn" popovertarget="${PROTECTED_POPOVER_ID}" aria-label="Why is this protected? Show capture options" title="Why is this protected? Show capture options"><span aria-hidden="true">\u24d8</span></button>`
 }
 
-/** Protected-recording action once the capture note has been dismissed: the
- * row's action collapses to a single link straight to the recording's
- * SharePoint page (where the extension is run) plus a small \u24d8 that still
- * carries the "why" as a tooltip \u2014 for anyone who forgot. Plain <a
- * target="_blank">, so no click wiring is needed (native browser behavior). */
+/** The \u2197 open-link for ONE recording \u2014 opens that recording's own SharePoint
+ * page in a new tab (where the extension is run). Uses the OPEN icon, never the
+ * info icon. Plain <a target="_blank" rel="noopener">, so no click wiring is
+ * needed. Used both on protected rows and in the bulk status list. */
 function protectedOpenLinkHtml(rec: RecordingItem): string {
   const recUrl = escapeHtml(rec.url)
-  return `<a class="protected-open-link" href="${recUrl}" target="_blank" rel="noopener" title="Protected \u2014 capture with the teams-transcript-md extension, then open here" aria-label="Open protected recording \u2014 capture with the browser extension"><span aria-hidden="true">\u24d8</span> Protected \u2014 capture with extension \u2197</a>`
+  return `<a class="protected-open-link" href="${recUrl}" target="_blank" rel="noopener" title="Open this recording's page \u2014 capture it there with the extension" aria-label="Open recording \u2014 capture with the browser extension">Open recording <span aria-hidden="true">\u2197</span></a>`
+}
+
+/** Create (once) the ONE shared, GENERIC protected-capture popover and return
+ * it. Reused by every protected row's \u24d8 trigger (they target it by id via the
+ * native Popover API) and by the auto-open on single/bulk protected failures.
+ *
+ * Uses popover="auto", which the modern-Chromium target (Edge/Chrome) fully
+ * supports and which gives three dismissals for free: the explicit \u00d7
+ * (popovertarget + popovertargetaction="hide"), click-outside (light dismiss),
+ * and Esc \u2014 plus one-open-at-a-time. autofocus on \u00d7 moves focus into the dialog
+ * on open. Its content is GENERIC (no per-recording link): the explanation, the
+ * "Get the extension" link, and the "don't automatically show" checkbox (wired
+ * here, once). */
+function ensureSharedProtectedPopover(): HTMLElement {
+  const existing = document.getElementById(PROTECTED_POPOVER_ID)
+  if (existing) return existing
+  const pop = document.createElement("div")
+  pop.id = PROTECTED_POPOVER_ID
+  pop.setAttribute("popover", "auto")
+  pop.setAttribute("role", "dialog")
+  pop.setAttribute("aria-label", "Protected recordings \u2014 capture options")
+  pop.className = "protected-popover"
+  pop.innerHTML = `
+    <button type="button" class="protected-popover-close" popovertarget="${PROTECTED_POPOVER_ID}" popovertargetaction="hide" aria-label="Close" title="Close" autofocus><span aria-hidden="true">\u00d7</span></button>
+    <p class="protected-popover-text">These recordings are protected by Microsoft's app allow-list, so m365-pull can't download their transcripts. Open the recording's own page and capture it there with the <strong>teams-transcript-md</strong> browser extension. (Capturing protected recordings is out of scope for this app.)</p>
+    <div class="protected-popover-links">
+      <a href="${escapeHtml(PROTECTED_CAPTURE_EXTENSION_URL)}" target="_blank" rel="noopener">Get the extension <span aria-hidden="true">\u2197</span></a>
+    </div>
+    <label class="protected-popover-dismiss">
+      <input type="checkbox" class="protected-dismiss-check">
+      Don\u2019t automatically show this again
+    </label>
+  `
+  document.body.appendChild(pop)
+  const cb = pop.querySelector<HTMLInputElement>(".protected-dismiss-check")
+  if (cb) {
+    cb.checked = isProtectedAutoPopupSuppressed()
+    cb.addEventListener("change", () => {
+      // Checking it only stops the AUTO popup \u2014 the \u24d8 and the open links keep
+      // working. Set the flag, close the popover, and re-render the list.
+      if (cb.checked) {
+        localStorage.setItem(PROTECTED_NOTE_DISMISSED_KEY, "1")
+      } else {
+        localStorage.removeItem(PROTECTED_NOTE_DISMISSED_KEY)
+      }
+      pop.hidePopover()
+      rerenderContainerList()
+    })
+  }
+  return pop
+}
+
+/** Auto-open the shared generic popover ONCE, unless the user suppressed the
+ * automatic popup. Idempotent: never throws if it's already open. Used by the
+ * single-item and bulk protected paths. */
+function autoOpenSharedProtectedPopover(): void {
+  if (isProtectedAutoPopupSuppressed()) return
+  const pop = ensureSharedProtectedPopover()
+  try {
+    if (!pop.matches(":popover-open")) pop.showPopover()
+  } catch {
+    /* already open, or not connected \u2014 ignore */
+  }
 }
 
 /** 4qr: the hidden-items management view. When "Show hidden" (showIgnored) is
@@ -2101,13 +2157,13 @@ function recordingArtifactRowHtml(
   // 4qr: flat/single recording rows carry a hide toggle (hides the owning chat).
   const hideBtn = flat ? hideToggleHtml("chat", chatId, ignoredIds.has(chatId)) : ""
   // Protected recording (SharePoint whitelist-gated mp4): hand off to the
-  // browser extension instead of the normal download button. The label is
-  // the row's terminal state; the note/link is the actual affordance.
+  // browser extension instead of the normal download button. Always shows BOTH
+  // affordances regardless of the auto-popup flag: the \u2197 OPEN-icon link (opens
+  // this recording's own page) and the \u24d8 INFO button (opens the ONE shared
+  // generic capture popover). The flag only controls the AUTOMATIC popover.
   const isProtected = protectedRecordingIds.has(rec.id)
   const actions = isProtected
-    ? `${hideBtn}<span class="dl-label protected">Protected \u2014 capture with extension</span>${
-        isProtectedCaptureNoteDismissed() ? protectedOpenLinkHtml(rec) : protectedCaptureNoteHtml(rec)
-      }`
+    ? `${hideBtn}<span class="dl-label protected">Protected \u2014 capture with extension</span>${protectedOpenLinkHtml(rec)}${protectedInfoBtnHtml()}`
     : `${hideBtn}${downloadedLabelHtml(recLastSync)}<button class="artifact-download" data-art-kind="recording" data-rec-id="${escapeHtml(rec.id)}" title="Download this recording now" aria-label="Download recording from ${escapeHtml(dateLabel)}"><span aria-hidden="true">\u2b07</span></button>`
   // kkc + 84b: every recording row (grouped and flat) fills the favorite column
   // with the shared recordings-stream \u2605, so the checkbox\u2192type-icon gap matches
@@ -4061,9 +4117,24 @@ async function downloadChat(
  * Callers count both separately from real failures. */
 type TranscriptOutcome = "ok" | "fail" | "cross-tenant" | "protected"
 
+/** Find a recording across all loaded containers by its id. Used to recover the
+ * RecordingItem (name + url) for a protected outcome in bulk flows that only
+ * carry the id (e.g. selected-artifact download). */
+function findRecordingById(recordingId: string): RecordingItem | undefined {
+  for (const container of recordingsState.containers) {
+    const rec = container.recordings.find((r) => r.id === recordingId)
+    if (rec) return rec
+  }
+  return undefined
+}
+
 async function downloadRecordingTranscript(
   recordingId: string,
   button: HTMLButtonElement,
+  // In a bulk run the CALLER aggregates the protected outcome (one status list
+  // + one auto-popover for the whole batch), so a protected hit here must NOT
+  // set the single-item status or auto-open the popover per item.
+  options: { bulk?: boolean } = {},
 ): Promise<TranscriptOutcome> {
   // Search all containers for the recording
   let recording: RecordingItem | undefined
@@ -4188,10 +4259,18 @@ async function downloadRecordingTranscript(
     // error to the global status bar.
     if (err instanceof ProtectedRecordingError) {
       protectedRecordingIds.add(recording.id)
+      if (options.bulk) {
+        // Bulk run: the caller aggregates one status list + one auto-popover
+        // for the whole batch, and re-renders once at the end. Just flag it.
+        return "protected"
+      }
+      // Single-item click: flip the row to protected, say why, and (unless the
+      // user opted out of the auto popup) open the shared generic popover once.
       setStatus(
         `\u2298 "${subject}" is protected \u2014 Microsoft only allows first-party apps to read its transcript. Use the browser extension instead.`,
       )
       rerenderContainerList()
+      autoOpenSharedProtectedPopover()
       return "protected"
     }
     // Cross-tenant recording: not a real failure \u2014 the .mp4 lives in another
@@ -4209,6 +4288,43 @@ async function downloadRecordingTranscript(
     button.disabled = false
     button.textContent = originalLabel || "Download transcript"
   }
+}
+
+/** Human-identifiable name for a protected recording in the bulk status list.
+ * Matches the `subject` used elsewhere (chatTopic, else filename). */
+function protectedRecName(rec: RecordingItem): string {
+  return rec.chatTopic?.trim() || rec.filename
+}
+
+/** Report a bulk run's outcome in the status area. When some recordings came
+ * back protected, render a LIST of them BELOW the summary line — each item by
+ * name with its OWN \u2197 OPEN-icon link to that recording's page (new tab). These
+ * per-item links live HERE (in the status list), NOT in the generic popover.
+ * Also auto-open the shared generic popover ONCE for the batch (unless the user
+ * suppressed the automatic popup). */
+function reportBulkDownloadResult(summaryText: string, protectedRecs: RecordingItem[]): void {
+  const status = el<HTMLDivElement>("status")
+  status.className = ""
+  if (protectedRecs.length === 0) {
+    status.textContent = summaryText
+    return
+  }
+  const n = protectedRecs.length
+  const header = `${n} recording${n !== 1 ? "s" : ""} ${n !== 1 ? "are" : "is"} protected \u2014 capture ${n !== 1 ? "them" : "it"} with the extension:`
+  const items = protectedRecs
+    .map(
+      (rec) =>
+        `<li><span class="protected-status-name">${escapeHtml(protectedRecName(rec))}</span> ${protectedOpenLinkHtml(rec)}</li>`,
+    )
+    .join("")
+  status.innerHTML =
+    `<div class="protected-status-summary">${escapeHtml(summaryText)}</div>` +
+    `<div class="protected-status-list">` +
+    `<div class="protected-status-header">${escapeHtml(header)}</div>` +
+    `<ul>${items}</ul>` +
+    `</div>`
+  // One popover for the whole batch (not one per item).
+  autoOpenSharedProtectedPopover()
 }
 
 /** Sync all recordings in a container row. */
@@ -4231,25 +4347,29 @@ async function downloadContainerTranscripts(
   let ok = 0
   let fail = 0
   let crossTenant = 0
-  let protectedCount = 0
+  const protectedRecs: RecordingItem[] = []
   for (let i = 0; i < container.recordings.length; i++) {
     const rec = container.recordings[i]
     button.textContent = `Downloading ${i + 1}/${container.recordings.length}\u2026`
     const tempBtn = document.createElement("button")
-    const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
+    // bulk: suppress the per-item status + per-item auto-popover; we aggregate
+    // one status list + one popover for the whole batch below.
+    const outcome = await downloadRecordingTranscript(rec.id, tempBtn, { bulk: true })
     if (outcome === "ok") ok++
     else if (outcome === "cross-tenant") crossTenant++
     // Protected recordings flag their own row (via protectedRecordingIds) and
-    // aren't a failure — don't abort the batch, just skip past this one and
-    // keep counting them separately from real failures.
-    else if (outcome === "protected") protectedCount++
+    // aren't a failure — don't abort the batch, just collect them and keep
+    // counting them separately from real failures.
+    else if (outcome === "protected") protectedRecs.push(rec)
     else fail++
   }
   button.disabled = false
   button.textContent = originalLabel || "Download"
-  setStatus(
-    `Download complete \u2014 saved ${ok} transcript${ok !== 1 ? "s" : ""}${crossTenant > 0 ? `, ${crossTenant} from another organization (unavailable)` : ""}${protectedCount > 0 ? `, ${protectedCount} protected (use the browser extension)` : ""}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
-  )
+  // Re-render once so every newly-protected row shows its hand-off affordances.
+  rerenderContainerList()
+  const protectedCount = protectedRecs.length
+  const summary = `Download complete \u2014 saved ${ok} transcript${ok !== 1 ? "s" : ""}${crossTenant > 0 ? `, ${crossTenant} from another organization (unavailable)` : ""}${protectedCount > 0 ? `, ${protectedCount} protected (use the browser extension)` : ""}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`
+  reportBulkDownloadResult(summary, protectedRecs)
 }
 
 // ----- Unified container sync -----
@@ -4379,6 +4499,7 @@ async function downloadSelectedArtifacts(): Promise<void> {
   btn.disabled = true
   let done = 0
   let ok = 0
+  const protectedRecs: RecordingItem[] = []
 
   for (const artifactId of artifacts) {
     done++
@@ -4394,8 +4515,13 @@ async function downloadSelectedArtifacts(): Promise<void> {
       }
     } else if (artifactId.startsWith("rec:")) {
       const recId = artifactId.slice(4)
-      const outcome = await downloadRecordingTranscript(recId, tempBtn)
+      // bulk: aggregate protected outcomes into one status list + one popover.
+      const outcome = await downloadRecordingTranscript(recId, tempBtn, { bulk: true })
       if (outcome === "ok") ok++
+      else if (outcome === "protected") {
+        const rec = findRecordingById(recId)
+        if (rec) protectedRecs.push(rec)
+      }
     } else if (artifactId.startsWith("chan:")) {
       // Selected channel: download all threads in window via the same path as the
       // per-row Download button.
@@ -4420,8 +4546,12 @@ async function downloadSelectedArtifacts(): Promise<void> {
       cb.checked = false
       cb.indeterminate = false
     })
-  setStatus(
+  // Re-render once so any newly-protected rows show their hand-off affordances,
+  // then report (with the protected list + one batch popover, if any).
+  rerenderContainerList()
+  reportBulkDownloadResult(
     `Download complete \u2014 ${ok} of ${artifacts.length} artifact${artifacts.length !== 1 ? "s" : ""} saved.`,
+    protectedRecs,
   )
 }
 
