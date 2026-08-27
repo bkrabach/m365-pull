@@ -51,7 +51,7 @@ import {
   ageMs,
   formatAge,
 } from "./cache/chats-cache"
-import { loadMarks, saveMarks } from "./cache/marks"
+import { loadMarks, saveMarks, loadRemovedMarks, saveRemovedMarks } from "./cache/marks"
 import { loadIgnored, saveIgnored } from "./cache/ignored"
 import { loadChatPrefs, saveChatPrefs } from "./cache/chat-prefs"
 import { loadRecordingPrefs, saveRecordingPrefs } from "./cache/recording-prefs"
@@ -216,6 +216,13 @@ let filterState: FilterState = {
  * Persisted per-device in ui-state. Defaults to collapsed. */
 let teamPickerCollapsed = true
 let markedIds: Set<string> = new Set()
+/** Tombstones for `markedIds`: stream keys explicitly un-favorited (same key
+ * shape as markedIds \u2014 bare chatId, `chatId::rec`, or `channelId::chan`).
+ * Needed so an OneDrive merge (mergeStates) can tell "never favorited" apart
+ * from "favorited, then explicitly un-favorited" and let the removal win over
+ * a stale device's copy of markedIds. Cleared for a key the moment that key
+ * is favorited again. See buildLocalState / pullAndMergeOneDriveState. */
+let removedMarkedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
 let recordingPrefs: Record<string, RecordingPrefs> = {}
@@ -687,10 +694,11 @@ function typeLabel(type: string): string {
 
 function buildLocalState(): AppState {
   return {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     updatedBy: deviceIdentifier(),
     marks: [...markedIds].sort(),
+    removedMarks: removedMarkedIds.size > 0 ? [...removedMarkedIds].sort() : undefined,
     ignored: ignoredIds.size > 0 ? [...ignoredIds].sort() : undefined,
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
     recordingPrefs:
@@ -806,6 +814,16 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       [...mergedMarks].some((id) => !markedIds.has(id))
     markedIds = mergedMarks
     saveMarks(userCacheKey(), markedIds)
+    // Tombstones follow the same merge (mergeStates already unioned both
+    // sides' removedMarks and subtracted them from `merged.marks` above) --
+    // adopt the merged removedMarks locally so a subsequent toggle/merge on
+    // this device keeps seeing every removal any device has recorded.
+    const mergedRemovedMarks = new Set(merged.removedMarks ?? [])
+    const removedMarksChanged =
+      mergedRemovedMarks.size !== removedMarkedIds.size ||
+      [...mergedRemovedMarks].some((id) => !removedMarkedIds.has(id))
+    removedMarkedIds = mergedRemovedMarks
+    saveRemovedMarks(userCacheKey(), removedMarkedIds)
     const mergedIgnored = new Set(merged.ignored ?? [])
     const ignoredChanged =
       mergedIgnored.size !== ignoredIds.size ||
@@ -831,7 +849,12 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       if (userPrefsChanged) syncUserPrefsToUI()
     }
     const changed =
-      marksChanged || ignoredChanged || prefsChanged || recordingPrefsChanged || userPrefsChanged
+      marksChanged ||
+      removedMarksChanged ||
+      ignoredChanged ||
+      prefsChanged ||
+      recordingPrefsChanged ||
+      userPrefsChanged
     if (changed) {
       await saveOneDriveState(msal, {
         ...merged,
@@ -952,6 +975,7 @@ function render(): void {
   }
 
   markedIds = loadMarks(userCacheKey())
+  removedMarkedIds = loadRemovedMarks(userCacheKey())
   ignoredIds = loadIgnored(userCacheKey())
   // Phase 2 favorites migration (gated, runs once per device): legacy v1 marks
   // are whole-container keeps stored as bare chatIds. Convert each to favorite
@@ -1150,6 +1174,20 @@ function render(): void {
 }
 
 function wireGlobalHandlers(account: AccountInfo): void {
+  // Flush any pending debounced OneDrive save (SAVE_DEBOUNCE_MS = 1500) the
+  // moment the tab is going away, so a favorite removal made just before
+  // closing/backgrounding the tab still reaches OneDrive instead of being
+  // lost to the debounce window. `pagehide` fires on tab close/navigation;
+  // `visibilitychange` -> "hidden" also covers backgrounding (mobile, tab
+  // switch away) which doesn't always fire pagehide. Registered once here.
+  const flushOnHide = (): void => {
+    void flushOneDriveSave()
+  }
+  window.addEventListener("pagehide", flushOnHide)
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushOnHide()
+  })
+
   el<HTMLButtonElement>("signout").addEventListener("click", () => {
     void msal.logoutRedirect({ account })
   })
@@ -2464,30 +2502,40 @@ function clearIgnoreOnFavorite(chatId: string): void {
   }
 }
 
-/** Toggle the Favorite state of a chat's MESSAGES stream (key = bare chatId). */
+/** Toggle the Favorite state of a chat's MESSAGES stream (key = bare chatId).
+ * Removals are tombstoned (added to removedMarkedIds) and adds clear the
+ * tombstone, so an OneDrive merge never resurrects an explicit un-favorite
+ * against a stale device's copy of markedIds \u2014 see mergeStates. */
 function toggleFavoriteMessages(chatId: string): void {
   if (markedIds.has(chatId)) {
     markedIds.delete(chatId)
+    removedMarkedIds.add(chatId)
   } else {
     markedIds.add(chatId)
+    removedMarkedIds.delete(chatId)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
 }
 
-/** Toggle the Favorite state of a chat's RECORDINGS stream (key = chatId::rec). */
+/** Toggle the Favorite state of a chat's RECORDINGS stream (key = chatId::rec).
+ * Tombstoned on removal / un-tombstoned on add, same as toggleFavoriteMessages. */
 function toggleFavoriteRecordings(chatId: string): void {
   const key = recStreamKey(chatId)
   if (markedIds.has(key)) {
     markedIds.delete(key)
+    removedMarkedIds.add(key)
   } else {
     markedIds.add(key)
+    removedMarkedIds.delete(key)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
@@ -2508,12 +2556,17 @@ function toggleChatFavorite(chatId: string): void {
   if (isChatFavorited(chatId)) {
     markedIds.delete(chatId)
     markedIds.delete(recKey)
+    removedMarkedIds.add(chatId)
+    removedMarkedIds.add(recKey)
   } else {
     markedIds.add(chatId)
     markedIds.add(recKey)
+    removedMarkedIds.delete(chatId)
+    removedMarkedIds.delete(recKey)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
@@ -2521,13 +2574,16 @@ function toggleChatFavorite(chatId: string): void {
 
 /** Toggle the Favorite state of a channel stream (key = channelId::chan).
  * Favoriting clears the channel's ignored state. Also triggers a lazy preview
- * fetch so the 📬 count resolves immediately for a newly-favorited channel. */
+ * fetch so the 📬 count resolves immediately for a newly-favorited channel.
+ * Tombstoned on removal / un-tombstoned on add, same as the chat toggles. */
 function toggleChannelFavorite(channelId: string): void {
   const key = chanStreamKey(channelId)
   if (markedIds.has(key)) {
     markedIds.delete(key)
+    removedMarkedIds.add(key)
   } else {
     markedIds.add(key)
+    removedMarkedIds.delete(key)
     // Favoriting clears ignore (mutually exclusive)
     if (ignoredIds.has(channelId)) {
       ignoredIds.delete(channelId)
@@ -2537,6 +2593,7 @@ function toggleChannelFavorite(channelId: string): void {
     void ensureChannelPreview(channelId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   renderChannelSection()
   updateBulkButtons()
   scheduleOneDriveSave()
