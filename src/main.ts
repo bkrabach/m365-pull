@@ -51,7 +51,7 @@ import {
   ageMs,
   formatAge,
 } from "./cache/chats-cache"
-import { loadMarks, saveMarks } from "./cache/marks"
+import { loadMarks, saveMarks, loadRemovedMarks, saveRemovedMarks } from "./cache/marks"
 import { loadIgnored, saveIgnored } from "./cache/ignored"
 import { loadChatPrefs, saveChatPrefs } from "./cache/chat-prefs"
 import { loadRecordingPrefs, saveRecordingPrefs } from "./cache/recording-prefs"
@@ -216,6 +216,13 @@ let filterState: FilterState = {
  * Persisted per-device in ui-state. Defaults to collapsed. */
 let teamPickerCollapsed = true
 let markedIds: Set<string> = new Set()
+/** Tombstones for `markedIds`: stream keys explicitly un-favorited (same key
+ * shape as markedIds \u2014 bare chatId, `chatId::rec`, or `channelId::chan`).
+ * Needed so an OneDrive merge (mergeStates) can tell "never favorited" apart
+ * from "favorited, then explicitly un-favorited" and let the removal win over
+ * a stale device's copy of markedIds. Cleared for a key the moment that key
+ * is favorited again. See buildLocalState / pullAndMergeOneDriveState. */
+let removedMarkedIds: Set<string> = new Set()
 let ignoredIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
 let recordingPrefs: Record<string, RecordingPrefs> = {}
@@ -687,10 +694,11 @@ function typeLabel(type: string): string {
 
 function buildLocalState(): AppState {
   return {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     updatedBy: deviceIdentifier(),
     marks: [...markedIds].sort(),
+    removedMarks: removedMarkedIds.size > 0 ? [...removedMarkedIds].sort() : undefined,
     ignored: ignoredIds.size > 0 ? [...ignoredIds].sort() : undefined,
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
     recordingPrefs:
@@ -806,6 +814,16 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       [...mergedMarks].some((id) => !markedIds.has(id))
     markedIds = mergedMarks
     saveMarks(userCacheKey(), markedIds)
+    // Tombstones follow the same merge (mergeStates already unioned both
+    // sides' removedMarks and subtracted them from `merged.marks` above) --
+    // adopt the merged removedMarks locally so a subsequent toggle/merge on
+    // this device keeps seeing every removal any device has recorded.
+    const mergedRemovedMarks = new Set(merged.removedMarks ?? [])
+    const removedMarksChanged =
+      mergedRemovedMarks.size !== removedMarkedIds.size ||
+      [...mergedRemovedMarks].some((id) => !removedMarkedIds.has(id))
+    removedMarkedIds = mergedRemovedMarks
+    saveRemovedMarks(userCacheKey(), removedMarkedIds)
     const mergedIgnored = new Set(merged.ignored ?? [])
     const ignoredChanged =
       mergedIgnored.size !== ignoredIds.size ||
@@ -831,7 +849,12 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       if (userPrefsChanged) syncUserPrefsToUI()
     }
     const changed =
-      marksChanged || ignoredChanged || prefsChanged || recordingPrefsChanged || userPrefsChanged
+      marksChanged ||
+      removedMarksChanged ||
+      ignoredChanged ||
+      prefsChanged ||
+      recordingPrefsChanged ||
+      userPrefsChanged
     if (changed) {
       await saveOneDriveState(msal, {
         ...merged,
@@ -952,6 +975,7 @@ function render(): void {
   }
 
   markedIds = loadMarks(userCacheKey())
+  removedMarkedIds = loadRemovedMarks(userCacheKey())
   ignoredIds = loadIgnored(userCacheKey())
   // Phase 2 favorites migration (gated, runs once per device): legacy v1 marks
   // are whole-container keeps stored as bare chatIds. Convert each to favorite
@@ -1150,6 +1174,20 @@ function render(): void {
 }
 
 function wireGlobalHandlers(account: AccountInfo): void {
+  // Flush any pending debounced OneDrive save (SAVE_DEBOUNCE_MS = 1500) the
+  // moment the tab is going away, so a favorite removal made just before
+  // closing/backgrounding the tab still reaches OneDrive instead of being
+  // lost to the debounce window. `pagehide` fires on tab close/navigation;
+  // `visibilitychange` -> "hidden" also covers backgrounding (mobile, tab
+  // switch away) which doesn't always fire pagehide. Registered once here.
+  const flushOnHide = (): void => {
+    void flushOneDriveSave()
+  }
+  window.addEventListener("pagehide", flushOnHide)
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushOnHide()
+  })
+
   el<HTMLButtonElement>("signout").addEventListener("click", () => {
     void msal.logoutRedirect({ account })
   })
@@ -1579,7 +1617,10 @@ function rerenderContainerList(): void {
     list.querySelectorAll<HTMLButtonElement>('.fav-toggle:not([data-stream="channel"])').forEach((btn) => {
       btn.addEventListener("click", () => {
         const chatId = btn.dataset.chatId!
-        if (btn.dataset.stream === "recordings") {
+        if (btn.dataset.stream === "header") {
+          // Collapsed group header star: whole-group toggle (both streams).
+          toggleChatFavorite(chatId)
+        } else if (btn.dataset.stream === "recordings") {
           toggleFavoriteRecordings(chatId)
         } else {
           toggleFavoriteMessages(chatId)
@@ -2033,13 +2074,15 @@ function renderContainerRow(
   const caret = `<button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
   const checkbox = `<input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">`
   // 81x: the collapsed chat header star is now a real toggle (was a read-only
-  // .fav-state span). A chat has two streams; the header star toggles the
-  // MESSAGES stream (documented choice) and is wired by the shared .fav-toggle
-  // listener. It still DISPLAYS filled whenever EITHER stream is favorited
-  // (isMarked), so the collapsed row honestly signals "this chat is favorited"
-  // even when only the Recordings stream is favorited (toggle that from the
-  // expanded Recordings header).
-  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to toggle the Messages stream (expand to change Recordings)" : "Favorite the Messages stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
+  // .fav-state span). A chat has two streams; the header star is a WHOLE-GROUP
+  // toggle (data-stream="header", routed to toggleChatFavorite) so its click
+  // semantics stay unambiguous even when both streams are already favorited
+  // (the common post-migration case): if the chat is favorited at all, the
+  // click un-favorites BOTH streams; otherwise it favorites both. It still
+  // DISPLAYS filled whenever EITHER stream is favorited (isMarked), so the
+  // collapsed row honestly signals "this chat is favorited" \u2014 expand and use
+  // the per-stream stars there to favorite/un-favorite just one stream.
+  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="header" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to un-favorite both streams (expand to change just one)" : "Favorite this chat (both streams)"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
   const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(sub)}</div>
@@ -2459,30 +2502,71 @@ function clearIgnoreOnFavorite(chatId: string): void {
   }
 }
 
-/** Toggle the Favorite state of a chat's MESSAGES stream (key = bare chatId). */
+/** Toggle the Favorite state of a chat's MESSAGES stream (key = bare chatId).
+ * Removals are tombstoned (added to removedMarkedIds) and adds clear the
+ * tombstone, so an OneDrive merge never resurrects an explicit un-favorite
+ * against a stale device's copy of markedIds \u2014 see mergeStates. */
 function toggleFavoriteMessages(chatId: string): void {
   if (markedIds.has(chatId)) {
     markedIds.delete(chatId)
+    removedMarkedIds.add(chatId)
   } else {
     markedIds.add(chatId)
+    removedMarkedIds.delete(chatId)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
 }
 
-/** Toggle the Favorite state of a chat's RECORDINGS stream (key = chatId::rec). */
+/** Toggle the Favorite state of a chat's RECORDINGS stream (key = chatId::rec).
+ * Tombstoned on removal / un-tombstoned on add, same as toggleFavoriteMessages. */
 function toggleFavoriteRecordings(chatId: string): void {
   const key = recStreamKey(chatId)
   if (markedIds.has(key)) {
     markedIds.delete(key)
+    removedMarkedIds.add(key)
   } else {
     markedIds.add(key)
+    removedMarkedIds.delete(key)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
+  rerenderContainerList()
+  updateBulkButtons()
+  scheduleOneDriveSave()
+}
+
+/** Toggle the Favorite state of a chat's ENTIRE group \u2014 BOTH streams at once
+ * (messages = bare chatId, recordings = chatId::rec). Used by the collapsed
+ * group header star, which DISPLAYS filled whenever EITHER stream is
+ * favorited (isChatFavorited) but needs unambiguous click semantics: if the
+ * chat is currently favorited (on either stream), the click removes BOTH
+ * streams; otherwise it adds both. Without this, clicking the header star
+ * when both streams were already favorited (the common case after the v1\u2192v2
+ * migration) only cleared messages via toggleFavoriteMessages \u2014
+ * isChatFavorited() stayed true (recordings still favorited) and nothing
+ * visibly changed. */
+function toggleChatFavorite(chatId: string): void {
+  const recKey = recStreamKey(chatId)
+  if (isChatFavorited(chatId)) {
+    markedIds.delete(chatId)
+    markedIds.delete(recKey)
+    removedMarkedIds.add(chatId)
+    removedMarkedIds.add(recKey)
+  } else {
+    markedIds.add(chatId)
+    markedIds.add(recKey)
+    removedMarkedIds.delete(chatId)
+    removedMarkedIds.delete(recKey)
+    clearIgnoreOnFavorite(chatId)
+  }
+  saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   rerenderContainerList()
   updateBulkButtons()
   scheduleOneDriveSave()
@@ -2490,13 +2574,16 @@ function toggleFavoriteRecordings(chatId: string): void {
 
 /** Toggle the Favorite state of a channel stream (key = channelId::chan).
  * Favoriting clears the channel's ignored state. Also triggers a lazy preview
- * fetch so the 📬 count resolves immediately for a newly-favorited channel. */
+ * fetch so the 📬 count resolves immediately for a newly-favorited channel.
+ * Tombstoned on removal / un-tombstoned on add, same as the chat toggles. */
 function toggleChannelFavorite(channelId: string): void {
   const key = chanStreamKey(channelId)
   if (markedIds.has(key)) {
     markedIds.delete(key)
+    removedMarkedIds.add(key)
   } else {
     markedIds.add(key)
+    removedMarkedIds.delete(key)
     // Favoriting clears ignore (mutually exclusive)
     if (ignoredIds.has(channelId)) {
       ignoredIds.delete(channelId)
@@ -2506,6 +2593,7 @@ function toggleChannelFavorite(channelId: string): void {
     void ensureChannelPreview(channelId)
   }
   saveMarks(userCacheKey(), markedIds)
+  saveRemovedMarks(userCacheKey(), removedMarkedIds)
   renderChannelSection()
   updateBulkButtons()
   scheduleOneDriveSave()
@@ -4534,20 +4622,16 @@ async function downloadSelectedArtifacts(): Promise<void> {
     }
   }
 
-  // Clear selection
-  selectedArtifacts.clear()
+  // Selection PERSISTS after a batch download (the user may want to tweak
+  // settings and re-download the same selection, then clear manually) — do
+  // NOT clear selectedArtifacts or reset checkboxes here.
   btn.disabled = false
   btn.textContent = originalLabel || ""
   updateSelectedButton()
-  // Reset all artifact and group checkboxes in the DOM
-  document
-    .querySelectorAll<HTMLInputElement>(".artifact-check, .select-all-check")
-    .forEach((cb) => {
-      cb.checked = false
-      cb.indeterminate = false
-    })
-  // Re-render once so any newly-protected rows show their hand-off affordances,
-  // then report (with the protected list + one batch popover, if any).
+  // Re-render once so any newly-protected rows show their hand-off affordances;
+  // this also rebuilds checkbox visual state from the (still-populated)
+  // selectedArtifacts set, so boxes stay checked. Then report (with the
+  // protected list + one batch popover, if any).
   rerenderContainerList()
   reportBulkDownloadResult(
     `Download complete \u2014 ${ok} of ${artifacts.length} artifact${artifacts.length !== 1 ? "s" : ""} saved.`,

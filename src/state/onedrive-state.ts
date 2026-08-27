@@ -70,19 +70,35 @@ export interface AppState {
   /** Schema version. 1 = legacy whole-container marks (bare chatId).
    * 2 = Phase 2 per-stream favorites: messages stream = bare `chatId`,
    * recordings stream = `chatId::rec`. Still a single `marks` string set,
-   * so the additive union merge below works unchanged across versions. */
-  version: 1 | 2
+   * so the additive union merge below works unchanged across versions.
+   * 3 = adds `removedMarks` tombstones (see mergeStates) so an explicit
+   * un-favorite survives being merged against a stale device's copy of
+   * `marks` that still contains the removed id. A v1 or v2 state simply has
+   * no removedMarks -> treated as empty; no separate v2->v3 migration step
+   * is needed (only the existing v1->v2 per-stream migration still runs, in
+   * main.ts, gated on the remote's own version). */
+  version: 1 | 2 | 3
   updatedAt: string
   updatedBy: string
-  /** Favorited stream IDs (a single union-merged string set):
+  /** Favorited stream IDs (a single merged string set):
    *   messages stream  -> bare `chatId`
    *   recordings stream -> `chatId::rec`
    * v1 states hold only bare chatIds (whole-container keeps); they are
    * migrated to favorite BOTH streams on first Phase 2 load. */
   marks: string[]
+  /** Tombstones for `marks`: stream IDs (same key shape as `marks`) that have
+   * been explicitly un-favorited. A removal is only ever expressed as an id's
+   * ABSENCE from `marks` -- without a tombstone, a stale copy of `marks` held
+   * by another device (or captured just inside the local save-debounce
+   * window) would silently resurrect it on the next merge, and that
+   * resurrection would then get written back to OneDrive. Cleared for a
+   * given id the moment that id is favorited again, so a genuine re-favorite
+   * still wins over an old tombstone. See mergeStates. */
+  removedMarks?: string[]
   /** Chat IDs the user has ignored. Hidden from the default list view;
    * revealed only via the "Show ignored" filter toggle. Merged additively
-   * like marks so ignores from one device are never silently dropped. */
+   * like marks so ignores from one device are never silently dropped.
+   * (Unlike marks, ignored has no tombstone -- see mergeStates.) */
   ignored?: string[]
   chatPrefs?: Record<string, ChatPrefs>
   recordingPrefs?: Record<string, RecordingPrefs>
@@ -122,11 +138,13 @@ export async function loadOneDriveState(
     )
   }
   const data = (await response.json()) as AppState
-  // Accept v1 (legacy whole-container marks) and v2 (per-stream favorites).
-  // v1 states are migrated in-app on load (marks gain `chatId::rec` for any
-  // bare chatId) and written back as v2. Unknown future versions are treated
-  // as empty so a newer client's schema is never silently corrupted by us.
-  if (data.version !== 1 && data.version !== 2) {
+  // Accept v1 (legacy whole-container marks), v2 (per-stream favorites), and
+  // v3 (adds removedMarks tombstones). v1 states are migrated in-app on load
+  // (marks gain `chatId::rec` for any bare chatId) and written back as v2+;
+  // v2 states simply have no removedMarks (treated as empty) -- no separate
+  // migration step is needed for v3. Unknown future versions are treated as
+  // empty so a newer client's schema is never silently corrupted by us.
+  if (data.version !== 1 && data.version !== 2 && data.version !== 3) {
     console.warn(
       "Unknown state schema version; treating as empty:",
       data.version,
@@ -158,15 +176,35 @@ export async function saveOneDriveState(
   }
 }
 
-/** Merge two states. Marks and ignored are unioned; chatPrefs prefer the newer entry. */
+/** Merge two states. Marks use tombstone-based merge (remove-wins over a
+ * stale copy, add-wins-on-refavorite — see below); ignored is still a plain
+ * additive union; chatPrefs prefer the newer entry. */
 export function mergeStates(
   local: AppState,
   remote: AppState | null,
 ): AppState {
   if (!remote) return local
-  // Marks: union — they're additive by nature
-  const marks = new Set<string>([...local.marks, ...remote.marks])
-  // Ignored: union — additive like marks (un-ignore is done explicitly, never lost)
+  // Marks: tombstone merge, NOT a plain union. A removal is only ever
+  // expressed as an id's ABSENCE from `marks` — so a stale copy of `marks`
+  // held by the other side (a lagging device, or a copy captured just inside
+  // the local save-debounce window) would otherwise silently resurrect it
+  // right here, and that resurrection would then get written back to
+  // OneDrive. `removedMarks` tracks every id that has been explicitly
+  // un-favorited: union both sides' tombstones, then subtract them from the
+  // unioned marks so a real removal always wins over a stale re-addition.
+  // Re-favoriting an id clears it from `removedMarks` at the toggle site
+  // (toggleFavoriteMessages/Recordings, toggleChatFavorite,
+  // toggleChannelFavorite in main.ts), so a genuine re-favorite still wins
+  // over an old tombstone once that clear has itself reached this side.
+  const removed = new Set<string>([
+    ...(local.removedMarks ?? []),
+    ...(remote.removedMarks ?? []),
+  ])
+  const marks = new Set<string>(
+    [...local.marks, ...remote.marks].filter((id) => !removed.has(id)),
+  )
+  // Ignored: union — additive like marks used to be (un-ignore is done
+  // explicitly, never lost). No tombstone here; see AppState.ignored.
   const ignored = new Set<string>([...(local.ignored ?? []), ...(remote.ignored ?? [])])
   // chatPrefs: prefer whichever side has a more recent updatedAt
   const localTime = Date.parse(local.updatedAt) || 0
@@ -185,12 +223,15 @@ export function mergeStates(
     ...(newer.recordingPrefs ?? {}),
   }
   return {
-    // Carry-over fix: emit v2 so the v1->v2 favorites migration guard fires once,
-    // not on every sync (a v1 stamp here re-triggered migration each merge).
-    version: 2,
+    // Carry-over fix: emit v3 so both the v1->v2 favorites migration guard
+    // (fires once, not on every sync — a v1 stamp here re-triggered migration
+    // each merge) and this merge's own removedMarks tombstones stay stable
+    // across repeated merges.
+    version: 3,
     updatedAt: new Date().toISOString(),
     updatedBy: local.updatedBy || remote.updatedBy,
     marks: [...marks].sort(),
+    removedMarks: removed.size > 0 ? [...removed].sort() : undefined,
     ignored: ignored.size > 0 ? [...ignored].sort() : undefined,
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
     recordingPrefs:
