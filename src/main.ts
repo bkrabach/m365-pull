@@ -4534,20 +4534,16 @@ async function downloadSelectedArtifacts(): Promise<void> {
     }
   }
 
-  // Clear selection
-  selectedArtifacts.clear()
+  // Selection PERSISTS after a batch download (the user may want to tweak
+  // settings and re-download the same selection, then clear manually) — do
+  // NOT clear selectedArtifacts or reset checkboxes here.
   btn.disabled = false
   btn.textContent = originalLabel || ""
   updateSelectedButton()
-  // Reset all artifact and group checkboxes in the DOM
-  document
-    .querySelectorAll<HTMLInputElement>(".artifact-check, .select-all-check")
-    .forEach((cb) => {
-      cb.checked = false
-      cb.indeterminate = false
-    })
-  // Re-render once so any newly-protected rows show their hand-off affordances,
-  // then report (with the protected list + one batch popover, if any).
+  // Re-render once so any newly-protected rows show their hand-off affordances;
+  // this also rebuilds checkbox visual state from the (still-populated)
+  // selectedArtifacts set, so boxes stay checked. Then report (with the
+  // protected list + one batch popover, if any).
   rerenderContainerList()
   reportBulkDownloadResult(
     `Download complete \u2014 ${ok} of ${artifacts.length} artifact${artifacts.length !== 1 ? "s" : ""} saved.`,
