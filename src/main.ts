@@ -1579,7 +1579,10 @@ function rerenderContainerList(): void {
     list.querySelectorAll<HTMLButtonElement>('.fav-toggle:not([data-stream="channel"])').forEach((btn) => {
       btn.addEventListener("click", () => {
         const chatId = btn.dataset.chatId!
-        if (btn.dataset.stream === "recordings") {
+        if (btn.dataset.stream === "header") {
+          // Collapsed group header star: whole-group toggle (both streams).
+          toggleChatFavorite(chatId)
+        } else if (btn.dataset.stream === "recordings") {
           toggleFavoriteRecordings(chatId)
         } else {
           toggleFavoriteMessages(chatId)
@@ -2033,13 +2036,15 @@ function renderContainerRow(
   const caret = `<button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>`
   const checkbox = `<input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">`
   // 81x: the collapsed chat header star is now a real toggle (was a read-only
-  // .fav-state span). A chat has two streams; the header star toggles the
-  // MESSAGES stream (documented choice) and is wired by the shared .fav-toggle
-  // listener. It still DISPLAYS filled whenever EITHER stream is favorited
-  // (isMarked), so the collapsed row honestly signals "this chat is favorited"
-  // even when only the Recordings stream is favorited (toggle that from the
-  // expanded Recordings header).
-  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to toggle the Messages stream (expand to change Recordings)" : "Favorite the Messages stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
+  // .fav-state span). A chat has two streams; the header star is a WHOLE-GROUP
+  // toggle (data-stream="header", routed to toggleChatFavorite) so its click
+  // semantics stay unambiguous even when both streams are already favorited
+  // (the common post-migration case): if the chat is favorited at all, the
+  // click un-favorites BOTH streams; otherwise it favorites both. It still
+  // DISPLAYS filled whenever EITHER stream is favorited (isMarked), so the
+  // collapsed row honestly signals "this chat is favorited" \u2014 expand and use
+  // the per-stream stars there to favorite/un-favorite just one stream.
+  const favorite = `<button class="fav-toggle fav-header-toggle${isMarked ? " favorited" : ""}" data-stream="header" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Favorited \u2014 click to un-favorite both streams (expand to change just one)" : "Favorite this chat (both streams)"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>`
   const info = `<div class="chat-info">
           <div class="chat-name">${escapeHtml(name)}</div>
           <div class="chat-sub">${escapeHtml(sub)}</div>
@@ -2480,6 +2485,32 @@ function toggleFavoriteRecordings(chatId: string): void {
     markedIds.delete(key)
   } else {
     markedIds.add(key)
+    clearIgnoreOnFavorite(chatId)
+  }
+  saveMarks(userCacheKey(), markedIds)
+  rerenderContainerList()
+  updateBulkButtons()
+  scheduleOneDriveSave()
+}
+
+/** Toggle the Favorite state of a chat's ENTIRE group \u2014 BOTH streams at once
+ * (messages = bare chatId, recordings = chatId::rec). Used by the collapsed
+ * group header star, which DISPLAYS filled whenever EITHER stream is
+ * favorited (isChatFavorited) but needs unambiguous click semantics: if the
+ * chat is currently favorited (on either stream), the click removes BOTH
+ * streams; otherwise it adds both. Without this, clicking the header star
+ * when both streams were already favorited (the common case after the v1\u2192v2
+ * migration) only cleared messages via toggleFavoriteMessages \u2014
+ * isChatFavorited() stayed true (recordings still favorited) and nothing
+ * visibly changed. */
+function toggleChatFavorite(chatId: string): void {
+  const recKey = recStreamKey(chatId)
+  if (isChatFavorited(chatId)) {
+    markedIds.delete(chatId)
+    markedIds.delete(recKey)
+  } else {
+    markedIds.add(chatId)
+    markedIds.add(recKey)
     clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
